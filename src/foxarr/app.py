@@ -14,7 +14,14 @@ from fastapi.responses import JSONResponse
 from .prowlarr import ProwlarrClient, ProwlarrError
 from .selection import ReleaseSelectionError, parse_criteria, select_release
 from .storage import MovieNotFoundError, MovieStore
-from .transmission import build_download_plan, build_resolved_submit_preview
+from .transmission import (
+    TransmissionClient,
+    TransmissionConfirmationRequired,
+    TransmissionError,
+    TransmissionWorker,
+    build_download_plan,
+    build_resolved_submit_preview,
+)
 
 
 class FoxarrSettings:
@@ -33,6 +40,7 @@ class FoxarrSettings:
         download_dir: str | None = None,
         movie_download_dir: str | None = None,
         series_download_dir: str | None = None,
+        transmission_url: str | None = None,
         selection_profiles: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
@@ -62,6 +70,9 @@ class FoxarrSettings:
         )
         self.series_download_dir = series_download_dir or os.environ.get(
             "FOXARR_TRANSMISSION_SERIES_DIR", "/home/blackfox/data/serial"
+        )
+        self.transmission_url = transmission_url or os.environ.get(
+            "FOXARR_TRANSMISSION_RPC_URL", ""
         )
         if selection_profiles is not None:
             self.selection_profiles = selection_profiles
@@ -424,6 +435,158 @@ def create_app(
             raise HTTPException(status_code=404, detail="Search job not found") from error
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+
+    def transmission_worker() -> TransmissionWorker:
+        if not settings.transmission_url:
+            raise HTTPException(status_code=503, detail="Transmission is not configured")
+        return TransmissionWorker(TransmissionClient(settings.transmission_url))
+
+    def selected_job(job_id: int) -> dict[str, Any]:
+        try:
+            job = store.get_search_job(job_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+        if job["status"] not in {"selected", "download_planned", "paused", "downloading"}:
+            raise HTTPException(
+                status_code=409,
+                detail="only selected or submitted search jobs can use Transmission",
+            )
+        if not isinstance(job.get("selectedResult"), dict):
+            raise HTTPException(status_code=409, detail="search job has no selected result")
+        return job
+
+    @app.post("/api/internal/transmission/search/{job_id}/submit")
+    async def transmission_submit(job_id: int, request: Request) -> dict[str, Any]:
+        """Resolve and submit one selected release, always paused.
+
+        This is an external side effect. ``confirm`` must be exactly true;
+        otherwise no Prowlarr resolve or Transmission call is made.
+        """
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            if payload.get("confirm") is not True:
+                raise TransmissionConfirmationRequired(
+                    "Transmission submit requires explicit confirmation"
+                )
+            media_type = payload.get("mediaType", "movie")
+            if media_type not in {"movie", "series"}:
+                raise ValueError("mediaType must be movie or series")
+            job = selected_job(job_id)
+            selected = job["selectedResult"]
+            if not selected.get("guid"):
+                raise ValueError("selected result has no guid")
+            if not settings.prowlarr_url or not settings.prowlarr_api_key:
+                raise ValueError("Prowlarr is not configured")
+            default_dir = (
+                settings.movie_download_dir
+                if media_type == "movie"
+                else settings.series_download_dir
+            )
+            download_dir = payload.get("downloadDir", default_dir)
+            if not isinstance(download_dir, str):
+                raise TypeError("downloadDir must be a string")
+            _, download_url = ProwlarrClient(
+                settings.prowlarr_url,
+                settings.prowlarr_api_key,
+            ).resolve_download_url(
+                job["query"],
+                selected["guid"],
+                indexer_ids=job["indexerIds"],
+            )
+            result = transmission_worker().submit_paused(
+                job_id,
+                download_url,
+                download_dir,
+                media_type,
+            )
+            torrent = result["torrent"]
+            updated = store.update_transmission_status(
+                job_id,
+                int(torrent["torrentId"]),
+                str(torrent["status"]),
+                float(torrent.get("percentDone", 0)),
+                torrent.get("error"),
+                torrent.get("downloadDir") or download_dir,
+            )
+            return {
+                "job": updated,
+                "created": result["created"],
+                "mediaType": result["mediaType"],
+                "labels": result["labels"],
+                "torrent": torrent,
+                "paused": True,
+            }
+        except HTTPException:
+            raise
+        except TransmissionConfirmationRequired as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (ProwlarrError, TransmissionError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/internal/transmission/search/{job_id}/snapshot")
+    async def transmission_snapshot(job_id: int) -> dict[str, Any]:
+        job = selected_job(job_id)
+        torrent_id = job["transmission"]["torrentId"]
+        if not isinstance(torrent_id, int):
+            raise HTTPException(status_code=409, detail="search job has no Transmission torrent")
+        try:
+            snapshot = transmission_worker().snapshot(torrent_id)
+            updated = store.update_transmission_status(
+                job_id,
+                torrent_id,
+                str(snapshot["status"]),
+                float(snapshot.get("percentDone", 0)),
+                snapshot.get("error"),
+                snapshot.get("downloadDir"),
+            )
+            return {"job": updated, "torrent": snapshot}
+        except TransmissionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    async def transmission_control(job_id: int, request: Request, action: str) -> dict[str, Any]:
+        job = selected_job(job_id)
+        torrent_id = job["transmission"]["torrentId"]
+        if not isinstance(torrent_id, int):
+            raise HTTPException(status_code=409, detail="search job has no Transmission torrent")
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            if payload.get("confirm") is not True:
+                raise TransmissionConfirmationRequired(
+                    f"Transmission {action} requires explicit confirmation"
+                )
+            worker = transmission_worker()
+            snapshot = (
+                worker.start(torrent_id, confirm=True)
+                if action == "start"
+                else worker.stop(torrent_id, confirm=True)
+            )
+            updated = store.update_transmission_status(
+                job_id,
+                torrent_id,
+                str(snapshot["status"]),
+                float(snapshot.get("percentDone", 0)),
+                snapshot.get("error"),
+                snapshot.get("downloadDir"),
+            )
+            return {"job": updated, "torrent": snapshot}
+        except HTTPException:
+            raise
+        except TransmissionConfirmationRequired as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (TransmissionError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/internal/transmission/search/{job_id}/start")
+    async def transmission_start(job_id: int, request: Request) -> dict[str, Any]:
+        return await transmission_control(job_id, request, "start")
+
+    @app.post("/api/internal/transmission/search/{job_id}/stop")
+    async def transmission_stop(job_id: int, request: Request) -> dict[str, Any]:
+        return await transmission_control(job_id, request, "stop")
 
     return app
 

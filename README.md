@@ -176,6 +176,22 @@ It stores only torrent id, status, progress, remote directory, and an error
 string. It does not inspect Contabo media paths and does not call mirror or
 Jellyfin.
 
+The real Transmission adapter is deliberately confirmation-gated:
+
+```text
+POST /api/internal/transmission/search/{job_id}/submit
+POST /api/internal/transmission/search/{job_id}/snapshot
+POST /api/internal/transmission/search/{job_id}/start
+POST /api/internal/transmission/search/{job_id}/stop
+```
+
+`submit` always sends `paused: true` and is idempotent by the
+`foxarr-job-{job_id}` label. `submit`, `start`, and `stop` require an explicit
+JSON `{"confirm": true}`. Without confirmation, Foxarr performs no Prowlarr
+resolve and no Transmission RPC call. A Transmission completion remains
+`transmission_completed`/`awaiting_external_import`; it does not set Seerr's
+`hasFile` flag.
+
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests

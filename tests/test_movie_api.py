@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from foxarr.app import FoxarrSettings, create_app
 from foxarr.prowlarr import ProwlarrClient
 from foxarr.storage import MovieStore
-from foxarr.transmission import TransmissionClient, TransmissionError
+from foxarr.transmission import (
+    TransmissionClient,
+    TransmissionConfirmationRequired,
+    TransmissionError,
+    TransmissionWorker,
+)
 
 
 def make_client(api_key: str = "") -> TestClient:
@@ -689,3 +695,170 @@ def test_transmission_rpc_rejects_non_success_result() -> None:
         assert "torrent duplicate" in str(error)
     else:
         raise AssertionError("TransmissionError was not raised")
+
+
+def test_transmission_rpc_get_start_stop_and_safe_snapshot() -> None:
+    calls: list[dict] = []
+    torrent = {
+        "id": 42,
+        "name": "Matrix.mkv",
+        "status": 0,
+        "percentDone": 0,
+        "downloadDir": "/home/blackfox/data/film",
+        "totalSize": 100,
+        "labels": ["foxarr", "foxarr-job-6"],
+        "error": 0,
+        "errorString": "",
+        "rateDownload": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload)
+        method = payload["method"]
+        if method == "torrent-get":
+            return httpx.Response(200, json={"result": "success", "arguments": {"torrents": [torrent]}})
+        if method == "torrent-start":
+            torrent["status"] = 4
+            return httpx.Response(200, json={"result": "success"})
+        if method == "torrent-stop":
+            torrent["status"] = 0
+            return httpx.Response(200, json={"result": "success"})
+        raise AssertionError(method)
+
+    client = TransmissionClient(
+        "http://transmission.test/rpc",
+        transport=httpx.MockTransport(handler),
+    )
+    worker = TransmissionWorker(client)
+
+    snapshot = worker.snapshot(42)
+    assert snapshot == {
+        "torrentId": 42,
+        "name": "Matrix.mkv",
+        "status": "paused",
+        "lifecycleStatus": "paused",
+        "percentDone": 0,
+        "downloadDir": "/home/blackfox/data/film",
+        "totalSize": 100,
+        "labels": ["foxarr", "foxarr-job-6"],
+        "error": None,
+        "rateDownload": 0,
+    }
+    with pytest.raises(TransmissionConfirmationRequired):
+        worker.start(42)
+    started = worker.start(42, confirm=True)
+    assert started["status"] == "downloading"
+    stopped = worker.stop(42, confirm=True)
+    assert stopped["status"] == "paused"
+    assert [call["method"] for call in calls] == [
+        "torrent-get",
+        "torrent-start",
+        "torrent-get",
+        "torrent-stop",
+        "torrent-get",
+    ]
+
+
+def test_transmission_worker_submit_is_paused_and_idempotent() -> None:
+    calls: list[dict] = []
+    created = False
+    torrent = {
+        "id": 77,
+        "name": "Matrix.1080p.HEVC.mkv",
+        "status": 0,
+        "percentDone": 0,
+        "downloadDir": "/home/blackfox/data/film",
+        "totalSize": 100,
+        "labels": ["foxarr", "foxarr-job-6"],
+        "error": 0,
+        "errorString": "",
+        "rateDownload": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created
+        payload = json.loads(request.content)
+        calls.append(payload)
+        method = payload["method"]
+        if method == "torrent-get":
+            torrents = [torrent] if created else []
+            return httpx.Response(200, json={"result": "success", "arguments": {"torrents": torrents}})
+        if method == "torrent-add":
+            created = True
+            assert payload["arguments"]["paused"] is True
+            assert payload["arguments"]["labels"] == ["foxarr", "foxarr-job-6"]
+            return httpx.Response(
+                200,
+                json={"result": "success", "arguments": {"torrent-added": torrent}},
+            )
+        raise AssertionError(method)
+
+    worker = TransmissionWorker(
+        TransmissionClient(
+            "http://transmission.test/rpc",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    first = worker.submit_paused(
+        6,
+        "magnet:?xt=urn:btih:secret",
+        "/home/blackfox/data/film",
+    )
+    second = worker.submit_paused(
+        6,
+        "magnet:?xt=urn:btih:secret",
+        "/home/blackfox/data/film",
+    )
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert first["torrent"]["torrentId"] == second["torrent"]["torrentId"] == 77
+    assert "secret" not in str(first)
+    assert [call["method"] for call in calls] == ["torrent-get", "torrent-add", "torrent-get"]
+
+
+def test_transmission_submit_requires_confirmation_before_external_calls(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix 1080p HEVC",
+            "indexer": "test",
+            "indexerId": 1,
+            "protocol": "torrent",
+            "size": 10,
+            "seeders": 5,
+            "guid": "https://example.test/1",
+        }],
+    )
+    client.app.state.settings.transmission_url = "http://transmission.test/rpc"
+    job = client.post(
+        "/api/internal/dry-run/search",
+        json={"query": "Матрица", "indexerIds": [1]},
+    ).json()
+    client.post(f"/api/internal/dry-run/search/{job['id']}/select", json={})
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("external call must not happen without confirmation")
+
+    monkeypatch.setattr("foxarr.prowlarr.ProwlarrClient.resolve_download_url", fail_if_called)
+    monkeypatch.setattr("foxarr.transmission.TransmissionClient._rpc", fail_if_called)
+
+    response = client.post(
+        f"/api/internal/transmission/search/{job['id']}/submit",
+        json={"mediaType": "movie", "confirm": False},
+    )
+
+    assert response.status_code == 409
+    assert "explicit confirmation" in response.json()["detail"]
+
+
+def test_transmission_start_requires_confirmation() -> None:
+    client = make_client()
+    client.app.state.settings.transmission_url = "http://transmission.test/rpc"
+    response = client.post(
+        "/api/internal/transmission/search/1/start",
+        json={"confirm": False},
+    )
+    assert response.status_code == 404
