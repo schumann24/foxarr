@@ -68,6 +68,19 @@ the selected result with `status: selected`. It supports protocol, minimum
 seeders, maximum size, language, and quality preferences. It has no download
 client integration and cannot start a search by itself.
 
+For the next integration stage, a selected job can produce a side-effect-free
+download plan:
+
+```text
+POST /api/internal/dry-run/search/{job_id}/plan
+```
+
+The plan contains a preview of Transmission's `torrent-add` RPC, target
+directory, labels, and `execution: not_submitted`. The real download URL is
+deliberately not stored or resolved by this endpoint. Transmission RPC
+handshake and error handling are covered by local mock-transport tests, but no
+Transmission service is configured or called by Foxarr yet.
+
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests

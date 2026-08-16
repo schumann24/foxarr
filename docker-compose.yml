@@ -9,6 +9,7 @@ services:
       FOXARR_QUALITY_PROFILE_ID: "1"
       FOXARR_QUALITY_PROFILE_NAME: Any
       FOXARR_DRY_RUN: "true"
+      FOXARR_DOWNLOAD_DIR: /downloads/foxarr
       # Prowlarr runs on the Docker host in the current lab setup.
       # FOXARR_PROWLARR_URL: http://host.docker.internal:9696
       # FOXARR_PROWLARR_API_KEY: change-me

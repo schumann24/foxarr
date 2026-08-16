@@ -91,6 +91,8 @@ class MovieStore:
                 connection.execute(
                     "ALTER TABLE search_jobs ADD COLUMN selection_criteria_json TEXT"
                 )
+            if "download_plan_json" not in columns:
+                connection.execute("ALTER TABLE search_jobs ADD COLUMN download_plan_json TEXT")
 
     @staticmethod
     def _now() -> str:
@@ -294,6 +296,29 @@ class MovieStore:
             raise KeyError(job_id)
         return self._row_to_search_job(row)
 
+    def plan_search_job(self, job_id: int, plan: dict[str, Any]) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] not in {"selected", "download_planned"}:
+                raise ValueError("only selected search jobs can be planned")
+            connection.execute(
+                """
+                UPDATE search_jobs SET status='download_planned', download_plan_json=?,
+                    updated_at=? WHERE id=?
+                """,
+                (json.dumps(plan, ensure_ascii=False), now, job_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        assert updated is not None
+        return self._row_to_search_job(updated)
+
     def select_search_job(
         self,
         job_id: int,
@@ -350,6 +375,11 @@ class MovieStore:
             "selectionCriteria": (
                 json.loads(row["selection_criteria_json"])
                 if row["selection_criteria_json"]
+                else None
+            ),
+            "downloadPlan": (
+                json.loads(row["download_plan_json"])
+                if row["download_plan_json"]
                 else None
             ),
             "createdAt": row["created_at"],
