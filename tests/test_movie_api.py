@@ -261,6 +261,104 @@ def test_download_plan_is_preview_only(monkeypatch) -> None:
     ).json()["status"] == "download_planned"
 
 
+def test_download_plan_uses_media_type_directories(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix",
+            "indexer": "test",
+            "indexerId": 1,
+            "protocol": "torrent",
+            "size": 10,
+            "seeders": 5,
+            "guid": "https://example.test/1",
+        }],
+    )
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    ).json()
+    client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "local-test-key"},
+        json={},
+    )
+
+    response = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/plan",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"mediaType": "movie"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["downloadPlan"]["mediaType"] == "movie"
+    assert response.json()["downloadPlan"]["downloadDir"] == "/home/blackfox/data/film"
+
+
+def test_transmission_status_snapshot_maps_lifecycle(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix",
+            "indexer": "test",
+            "indexerId": 1,
+            "protocol": "torrent",
+            "size": 10,
+            "seeders": 5,
+            "guid": "https://example.test/1",
+        }],
+    )
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    ).json()
+    client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "local-test-key"},
+        json={},
+    )
+
+    paused = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/transmission",
+        headers={"X-Api-Key": "local-test-key"},
+        json={
+            "torrentId": 42,
+            "status": "stopped",
+            "percentDone": 0,
+            "downloadDir": "/home/blackfox/data/film",
+        },
+    )
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["transmission"] == {
+        "torrentId": 42,
+        "status": "stopped",
+        "percentDone": 0.0,
+        "downloadDir": "/home/blackfox/data/film",
+        "error": None,
+    }
+
+    completed = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/transmission",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"torrentId": 42, "status": "seeding", "percentDone": 1},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "transmission_completed"
+
+
+def test_transmission_status_snapshot_rejects_invalid_progress(monkeypatch) -> None:
+    client = make_search_client(monkeypatch, [])
+    response = client.post(
+        "/api/internal/dry-run/search/999/transmission",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"torrentId": 42, "status": "downloading", "percentDone": 2},
+    )
+    assert response.status_code == 400
+
+
 def test_submit_preview_resolves_url_ephemerally(monkeypatch) -> None:
     client = make_search_client(
         monkeypatch,

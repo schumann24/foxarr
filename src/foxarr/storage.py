@@ -93,6 +93,15 @@ class MovieStore:
                 )
             if "download_plan_json" not in columns:
                 connection.execute("ALTER TABLE search_jobs ADD COLUMN download_plan_json TEXT")
+            for name, definition in (
+                ("transmission_id", "INTEGER"),
+                ("transmission_status", "TEXT"),
+                ("transmission_percent_done", "REAL"),
+                ("transmission_download_dir", "TEXT"),
+                ("transmission_error", "TEXT"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE search_jobs ADD COLUMN {name} {definition}")
 
     @staticmethod
     def _now() -> str:
@@ -319,6 +328,58 @@ class MovieStore:
         assert updated is not None
         return self._row_to_search_job(updated)
 
+    def update_transmission_status(
+        self,
+        job_id: int,
+        torrent_id: int,
+        status: str,
+        percent_done: float,
+        error: Any = None,
+        download_dir: Any = None,
+    ) -> dict[str, Any]:
+        now = self._now()
+        if percent_done < 0 or percent_done > 1:
+            raise ValueError("percentDone must be between 0 and 1")
+        lifecycle = {
+            "paused": "paused",
+            "stopped": "paused",
+            "downloading": "downloading",
+            "queued": "downloading",
+            "seeding": "transmission_completed",
+            "completed": "transmission_completed",
+            "error": "error",
+        }.get(status.lower(), status)
+        if percent_done >= 1 and lifecycle not in {"error", "awaiting_external_import"}:
+            lifecycle = "transmission_completed"
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            connection.execute(
+                """
+                UPDATE search_jobs SET status=?, transmission_id=?, transmission_status=?,
+                    transmission_percent_done=?, transmission_download_dir=?,
+                    transmission_error=?, updated_at=? WHERE id=?
+                """,
+                (
+                    lifecycle,
+                    torrent_id,
+                    status,
+                    percent_done,
+                    download_dir,
+                    str(error) if error else None,
+                    now,
+                    job_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        assert updated is not None
+        return self._row_to_search_job(updated)
+
     def select_search_job(
         self,
         job_id: int,
@@ -382,6 +443,13 @@ class MovieStore:
                 if row["download_plan_json"]
                 else None
             ),
+            "transmission": {
+                "torrentId": row["transmission_id"],
+                "status": row["transmission_status"],
+                "percentDone": row["transmission_percent_done"],
+                "downloadDir": row["transmission_download_dir"],
+                "error": row["transmission_error"],
+            },
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }

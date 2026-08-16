@@ -29,6 +29,8 @@ class FoxarrSettings:
         prowlarr_api_key: str | None = None,
         dry_run: bool | None = None,
         download_dir: str | None = None,
+        movie_download_dir: str | None = None,
+        series_download_dir: str | None = None,
     ) -> None:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
         self.api_key = api_key if api_key is not None else os.environ.get("FOXARR_API_KEY", "")
@@ -50,8 +52,13 @@ class FoxarrSettings:
             if dry_run is not None
             else os.environ.get("FOXARR_DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
         )
-        self.download_dir = download_dir or os.environ.get(
-            "FOXARR_DOWNLOAD_DIR", "/downloads/foxarr"
+        self.download_dir = download_dir or os.environ.get("FOXARR_DOWNLOAD_DIR", "")
+        self.movie_download_dir = movie_download_dir or os.environ.get(
+            "FOXARR_TRANSMISSION_MOVIE_DIR",
+            self.download_dir or "/home/blackfox/data/film",
+        )
+        self.series_download_dir = series_download_dir or os.environ.get(
+            "FOXARR_TRANSMISSION_SERIES_DIR", "/home/blackfox/data/serial"
         )
 
 
@@ -241,7 +248,15 @@ def create_app(
             download_client = payload.get("downloadClient", "transmission")
             if not isinstance(download_client, str):
                 raise TypeError("downloadClient must be a string")
-            download_dir = payload.get("downloadDir", settings.download_dir)
+            media_type = payload.get("mediaType", "movie")
+            if media_type not in {"movie", "series"}:
+                raise ValueError("mediaType must be movie or series")
+            default_dir = (
+                settings.movie_download_dir
+                if media_type == "movie"
+                else settings.series_download_dir
+            )
+            download_dir = payload.get("downloadDir", default_dir)
             if not isinstance(download_dir, str):
                 raise TypeError("downloadDir must be a string")
             job = store.get_search_job(job_id)
@@ -254,6 +269,7 @@ def create_app(
                 download_dir,
                 download_client,
             )
+            plan["mediaType"] = media_type
             return store.plan_search_job(job_id, plan)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Search job not found") from error
@@ -267,7 +283,15 @@ def create_app(
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
-            download_dir = payload.get("downloadDir", settings.download_dir)
+            media_type = payload.get("mediaType", "movie")
+            if media_type not in {"movie", "series"}:
+                raise ValueError("mediaType must be movie or series")
+            default_dir = (
+                settings.movie_download_dir
+                if media_type == "movie"
+                else settings.series_download_dir
+            )
+            download_dir = payload.get("downloadDir", default_dir)
             if not isinstance(download_dir, str):
                 raise TypeError("downloadDir must be a string")
             job = store.get_search_job(job_id)
@@ -284,6 +308,7 @@ def create_app(
                 selected,
                 download_dir,
             )
+            plan["mediaType"] = media_type
             _, download_url = ProwlarrClient(
                 settings.prowlarr_url,
                 settings.prowlarr_api_key,
@@ -298,6 +323,35 @@ def create_app(
             raise HTTPException(status_code=404, detail="Search job not found") from error
         except (ProwlarrError, TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/internal/dry-run/search/{job_id}/transmission")
+    async def update_transmission_status(job_id: int, request: Request) -> dict[str, Any]:
+        """Persist a worker's safe Transmission status snapshot."""
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            torrent_id = payload.get("torrentId")
+            status = payload.get("status")
+            percent_done = payload.get("percentDone", 0)
+            if not isinstance(torrent_id, int) or isinstance(torrent_id, bool) or torrent_id < 1:
+                raise TypeError("torrentId must be a positive integer")
+            if not isinstance(status, str) or not status.strip():
+                raise TypeError("status must be a non-empty string")
+            if not isinstance(percent_done, (int, float)) or isinstance(percent_done, bool):
+                raise TypeError("percentDone must be a number")
+            return store.update_transmission_status(
+                job_id,
+                torrent_id,
+                status.strip(),
+                float(percent_done),
+                payload.get("error"),
+                payload.get("downloadDir"),
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     return app
 

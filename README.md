@@ -93,6 +93,34 @@ returns only `urlKind` plus a redacted `torrent-add` preview. The URL is not
 returned, logged, or written to SQLite. `execution` remains
 `not_submitted`.
 
+Transmission download directories are remote paths on the Transmission host,
+not paths inside the Foxarr container:
+
+```text
+FOXARR_TRANSMISSION_MOVIE_DIR=/home/blackfox/data/film
+FOXARR_TRANSMISSION_SERIES_DIR=/home/blackfox/data/serial
+```
+
+Foxarr monitors only Transmission state. The separate media-mirror service is
+outside Foxarr: it copies completed files from those directories to the media
+library, after which Jellyfin and Seerr perform their own availability sync.
+Foxarr lifecycle state can therefore be:
+
+```text
+selected → download_planned → paused → downloading
+→ transmission_completed → awaiting_external_import
+```
+
+The internal status snapshot endpoint is:
+
+```text
+POST /api/internal/dry-run/search/{job_id}/transmission
+```
+
+It stores only torrent id, status, progress, remote directory, and an error
+string. It does not inspect Contabo media paths and does not call mirror or
+Jellyfin.
+
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests

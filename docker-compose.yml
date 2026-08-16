@@ -9,7 +9,9 @@ services:
       FOXARR_QUALITY_PROFILE_ID: "1"
       FOXARR_QUALITY_PROFILE_NAME: Any
       FOXARR_DRY_RUN: "true"
-      FOXARR_DOWNLOAD_DIR: /downloads/foxarr
+      # These are paths on the Transmission host (trustno1), not in Foxarr.
+      FOXARR_TRANSMISSION_MOVIE_DIR: /home/blackfox/data/film
+      FOXARR_TRANSMISSION_SERIES_DIR: /home/blackfox/data/serial
       # Prowlarr runs on the Docker host in the current lab setup.
       # FOXARR_PROWLARR_URL: http://host.docker.internal:9696
       # FOXARR_PROWLARR_API_KEY: change-me
