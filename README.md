@@ -11,8 +11,9 @@ Seerr → Foxarr → Prowlarr → download client → media library
 ## Status
 
 🚧 **Early development.** The repository now contains a movie-only Radarr-compatible
-MVP. It accepts Seerr movie requests and persists them in SQLite, but it does
-not search indexers or download files yet.
+MVP. It accepts Seerr movie requests and persists them in SQLite. Prowlarr
+search is currently available only as an explicit read-only dry-run operation;
+Foxarr does not download files.
 
 Foxarr is **not** a Radarr fork. It will implement only the Radarr API surface required by Seerr and delegate search and download work to configurable providers.
 
@@ -35,11 +36,43 @@ Movie creation is idempotent by `tmdbId`. The MVP always reports
 `hasFile: false`; `addOptions.searchForMovie` is recorded but does not trigger
 external work.
 
+The explicit, read-only Prowlarr dry-run endpoints are:
+
+```text
+POST /api/internal/dry-run/search
+GET  /api/internal/dry-run/search/{job_id}
+```
+
+Example request:
+
+```json
+{
+  "query": "Матрица",
+  "indexerIds": [1],
+  "limit": 5
+}
+```
+
+The job stores safe release metadata in SQLite. It never calls Transmission
+and does not persist download or magnet URLs. Search is explicit; a normal
+Seerr movie request does not start it automatically.
+
+After a completed dry-run job, release selection is also explicit and local:
+
+```text
+POST /api/internal/dry-run/search/{job_id}/select
+```
+
+The endpoint ranks only the safe metadata already stored in the job and saves
+the selected result with `status: selected`. It supports protocol, minimum
+seeders, maximum size, language, and quality preferences. It has no download
+client integration and cannot start a search by itself.
+
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests
 - SQLite-backed request and job state
-- Prowlarr JSON API integration
+- Prowlarr JSON API integration (read-only dry-run first)
 - Release selection by quality, size, seeders, and language
 - Transmission RPC integration
 - Dry-run mode that searches and logs without downloading

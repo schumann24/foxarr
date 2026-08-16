@@ -62,6 +62,35 @@ class MovieStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL,
+                    indexer_ids_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    result_count INTEGER NOT NULL DEFAULT 0,
+                    results_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT,
+                    dry_run INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(search_jobs)").fetchall()
+            }
+            if "selected_index" not in columns:
+                connection.execute("ALTER TABLE search_jobs ADD COLUMN selected_index INTEGER")
+            if "selected_result_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE search_jobs ADD COLUMN selected_result_json TEXT"
+                )
+            if "selection_criteria_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE search_jobs ADD COLUMN selection_criteria_json TEXT"
+                )
 
     @staticmethod
     def _now() -> str:
@@ -221,6 +250,111 @@ class MovieStore:
         if row is None:
             raise MovieNotFoundError(movie_id)
         return self._row_to_movie(row)
+
+    def create_search_job(self, query: str, indexer_ids: list[int], limit: int) -> int:
+        now = self._now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO search_jobs (
+                    query, indexer_ids_json, status, result_count, results_json,
+                    error, dry_run, created_at, updated_at
+                ) VALUES (?, ?, 'running', 0, '[]', NULL, 1, ?, ?)
+                """,
+                (query, json.dumps(indexer_ids), now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_search_job(
+        self,
+        job_id: int,
+        results: list[dict[str, Any]],
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        now = self._now()
+        status = "failed" if error else "completed"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE search_jobs
+                SET status=?, result_count=?, results_json=?, error=?, updated_at=?
+                WHERE id=?
+                """,
+                (status, len(results), json.dumps(results, ensure_ascii=False), error, now, job_id),
+            )
+            row = connection.execute("SELECT * FROM search_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return self._row_to_search_job(row)
+
+    def get_search_job(self, job_id: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM search_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return self._row_to_search_job(row)
+
+    def select_search_job(
+        self,
+        job_id: int,
+        selected_index: int,
+        selected_result: dict[str, Any],
+        criteria: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] != "completed":
+                raise ValueError("only completed search jobs can be selected")
+            connection.execute(
+                """
+                UPDATE search_jobs
+                SET status='selected', selected_index=?, selected_result_json=?,
+                    selection_criteria_json=?, updated_at=? WHERE id=?
+                """,
+                (
+                    selected_index,
+                    json.dumps(selected_result, ensure_ascii=False),
+                    json.dumps(criteria, ensure_ascii=False),
+                    now,
+                    job_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM search_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        assert updated is not None
+        return self._row_to_search_job(updated)
+
+    @staticmethod
+    def _row_to_search_job(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "query": row["query"],
+            "indexerIds": json.loads(row["indexer_ids_json"]),
+            "status": row["status"],
+            "resultCount": row["result_count"],
+            "results": json.loads(row["results_json"]),
+            "error": row["error"],
+            "dryRun": bool(row["dry_run"]),
+            "selectedIndex": row["selected_index"],
+            "selectedResult": (
+                json.loads(row["selected_result_json"])
+                if row["selected_result_json"]
+                else None
+            ),
+            "selectionCriteria": (
+                json.loads(row["selection_criteria_json"])
+                if row["selection_criteria_json"]
+                else None
+            ),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
 
     @staticmethod
     def _row_to_movie(row: sqlite3.Row) -> dict[str, Any]:

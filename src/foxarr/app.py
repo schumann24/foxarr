@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from .prowlarr import ProwlarrClient, ProwlarrError
+from .selection import ReleaseSelectionError, parse_criteria, select_release
 from .storage import MovieNotFoundError, MovieStore
 
 
@@ -22,6 +24,9 @@ class FoxarrSettings:
         root_folder: str | None = None,
         quality_profile_id: int | None = None,
         quality_profile_name: str | None = None,
+        prowlarr_url: str | None = None,
+        prowlarr_api_key: str | None = None,
+        dry_run: bool | None = None,
     ) -> None:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
         self.api_key = api_key if api_key is not None else os.environ.get("FOXARR_API_KEY", "")
@@ -31,6 +36,17 @@ class FoxarrSettings:
         )
         self.quality_profile_name = quality_profile_name or os.environ.get(
             "FOXARR_QUALITY_PROFILE_NAME", "Any"
+        )
+        self.prowlarr_url = prowlarr_url or os.environ.get("FOXARR_PROWLARR_URL", "")
+        self.prowlarr_api_key = (
+            prowlarr_api_key
+            if prowlarr_api_key is not None
+            else os.environ.get("FOXARR_PROWLARR_API_KEY", "")
+        )
+        self.dry_run = (
+            dry_run
+            if dry_run is not None
+            else os.environ.get("FOXARR_DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
         )
 
 
@@ -142,6 +158,72 @@ def create_app(
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
             return store.create_or_update(payload)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/internal/dry-run/search")
+    async def dry_run_search(request: Request) -> dict[str, Any]:
+        if not settings.dry_run:
+            raise HTTPException(status_code=409, detail="dry-run mode is disabled")
+        if not settings.prowlarr_url or not settings.prowlarr_api_key:
+            raise HTTPException(status_code=503, detail="Prowlarr is not configured")
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            query = payload.get("query")
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("query must be a non-empty string")
+            indexer_ids = payload.get("indexerIds", [])
+            if not isinstance(indexer_ids, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool) for value in indexer_ids
+            ):
+                raise TypeError("indexerIds must be an array of integers")
+            limit = payload.get("limit", 20)
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise TypeError("limit must be an integer")
+            job_id = store.create_search_job(query.strip(), indexer_ids, limit)
+            try:
+                results = ProwlarrClient(
+                    settings.prowlarr_url,
+                    settings.prowlarr_api_key,
+                ).search(query, indexer_ids=indexer_ids, limit=limit)
+                return store.finish_search_job(job_id, results)
+            except (ProwlarrError, TypeError, ValueError) as error:
+                return store.finish_search_job(job_id, [], error=str(error))
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/internal/dry-run/search/{job_id}")
+    async def dry_run_search_status(job_id: int) -> dict[str, Any]:
+        try:
+            return store.get_search_job(job_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+
+    @app.post("/api/internal/dry-run/search/{job_id}/select")
+    async def dry_run_select_release(job_id: int, request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            criteria = parse_criteria(payload)
+            job = store.get_search_job(job_id)
+            selected_index, selected_result = select_release(job["results"], criteria)
+            criteria_payload = {
+                "preferredProtocols": list(criteria.preferred_protocols),
+                "minSeeders": criteria.min_seeders,
+                "maxSize": criteria.max_size,
+                "preferredLanguages": list(criteria.preferred_languages),
+                "preferredQuality": list(criteria.preferred_quality),
+            }
+            return store.select_search_job(
+                job_id, selected_index, selected_result, criteria_payload
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+        except ReleaseSelectionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
