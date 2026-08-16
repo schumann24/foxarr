@@ -148,20 +148,22 @@ class TransmissionClient:
             transport=self._transport,
             auth=self._auth,
         ) as client:
-            response = client.post(self.url, json=request, headers=headers)
-            if response.status_code == 409:
-                session_id = response.headers.get("X-Transmission-Session-Id")
-                if not session_id:
-                    raise TransmissionError("Transmission returned 409 without a session id")
-                self._session_id = session_id
-                response = client.post(
-                    self.url,
-                    json=request,
-                    headers={"X-Transmission-Session-Id": self._session_id},
-                )
             try:
+                response = client.post(self.url, json=request, headers=headers)
+                if response.status_code == 409:
+                    session_id = response.headers.get("X-Transmission-Session-Id")
+                    if not session_id:
+                        raise TransmissionError("Transmission returned 409 without a session id")
+                    self._session_id = session_id
+                    response = client.post(
+                        self.url,
+                        json=request,
+                        headers={"X-Transmission-Session-Id": self._session_id},
+                    )
                 response.raise_for_status()
                 payload = response.json()
+            except TransmissionError:
+                raise
             except (httpx.HTTPError, ValueError) as error:
                 raise TransmissionError(f"Transmission {method} RPC failed: {error}") from error
         if not isinstance(payload, dict):
