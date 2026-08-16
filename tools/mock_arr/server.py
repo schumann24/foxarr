@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -141,7 +140,7 @@ def _api_ver(request: Request) -> str:
 
 def _lookup_from_term(term: str) -> dict[str, Any]:
     """Parse term like tmdb:12345 / tvdb:12345 into a fake media object."""
-    source, _, raw_id = term.partition(":")
+    _, _, raw_id = term.partition(":")
     raw_id = raw_id.strip() or "1"
     try:
         numeric_id = int(raw_id)
@@ -374,7 +373,6 @@ async def movie_create(ver: str, request: Request):
 async def movie_delete(ver: str, movie_id: int):
     state["movies"].pop(str(movie_id), None)
     _save_state()
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +447,6 @@ async def series_delete(ver: str, series_id: int):
     state["series"].pop(str(series_id), None)
     state["episodes"] = {k: v for k, v in state["episodes"].items() if k[0] != series_id}
     _save_state()
-    return None
 
 
 @app.get("/api/{ver}/episode")
@@ -477,7 +474,6 @@ async def episode_monitor(ver: str, request: Request):
         if episode["id"] in ids:
             episode["monitored"] = monitored
     _save_state()
-    return None
 
 
 # ---------------------------------------------------------------------------

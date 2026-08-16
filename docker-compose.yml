@@ -1,0 +1,18 @@
+services:
+  foxarr:
+    build: .
+    container_name: foxarr
+    restart: unless-stopped
+    environment:
+      FOXARR_DATABASE: /data/foxarr.db
+      FOXARR_ROOT_FOLDER: /movies
+      FOXARR_QUALITY_PROFILE_ID: "1"
+      FOXARR_QUALITY_PROFILE_NAME: Any
+      # FOXARR_API_KEY: change-me
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - foxarr-data:/data
+
+volumes:
+  foxarr-data:

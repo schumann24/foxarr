@@ -10,11 +10,32 @@ Seerr → Foxarr → Prowlarr → download client → media library
 
 ## Status
 
-🚧 **Early development.** The repository currently contains the project scaffold and design notes. The first implementation target is movie requests with Prowlarr and Transmission, including a safe dry-run mode.
+🚧 **Early development.** The repository now contains a movie-only Radarr-compatible
+MVP. It accepts Seerr movie requests and persists them in SQLite, but it does
+not search indexers or download files yet.
 
 Foxarr is **not** a Radarr fork. It will implement only the Radarr API surface required by Seerr and delegate search and download work to configurable providers.
 
-## Planned MVP
+## Current movie MVP
+
+The service implements the minimum movie surface captured from Seerr 3.4.1:
+
+```text
+GET  /api/v3/system/status
+GET  /api/v3/qualityProfile
+GET  /api/v3/rootfolder
+GET  /api/v3/tag
+GET  /api/v3/movie/lookup
+POST /api/v3/movie
+GET  /api/v3/movie
+GET  /api/v3/movie/{id}
+```
+
+Movie creation is idempotent by `tmdbId`. The MVP always reports
+`hasFile: false`; `addOptions.searchForMovie` is recorded but does not trigger
+external work.
+
+## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests
 - SQLite-backed request and job state
@@ -42,7 +63,23 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 pytest
+ruff check .
 ```
+
+Run locally:
+
+```bash
+uvicorn foxarr.app:app --reload --port 7878
+```
+
+Or with Docker:
+
+```bash
+docker compose up --build
+```
+
+The SQLite database is stored in `/data/foxarr.db` in the container. Published
+ports default to loopback only.
 
 ## License
 
