@@ -143,6 +143,41 @@ def test_dry_run_search_saves_safe_results_and_job(monkeypatch) -> None:
     ).json()["id"] == job["id"]
 
 
+def test_dry_run_keeps_technical_metadata_but_strips_executable_urls(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix.1080p.WEB-DL.HEVC.DTS-HD.HDR10",
+            "protocol": "torrent",
+            "size": 10,
+            "seeders": 5,
+            "guid": "https://example.test/technical",
+            "videoCodec": "HEVC",
+            "audioCodec": "DTS-HD",
+            "source": "WEB-DL",
+            "hdr": "HDR10",
+            "downloadUrl": "https://secret.example/file.torrent",
+            "magnetUrl": "magnet:?xt=urn:btih:secret",
+        }],
+    )
+
+    response = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["videoCodec"] == "HEVC"
+    assert result["audioCodec"] == "DTS-HD"
+    assert result["source"] == "WEB-DL"
+    assert result["hdr"] == "HDR10"
+    assert "downloadUrl" not in result
+    assert "magnetUrl" not in result
+    assert "secret" not in str(response.json())
+
+
 def test_dry_run_requires_configured_prowlarr() -> None:
     client = make_client(api_key="local-test-key")
     response = client.post(
@@ -217,6 +252,133 @@ def test_dry_run_release_selection_rejects_no_match(monkeypatch) -> None:
         json={"minSeeders": 1},
     )
     assert response.status_code == 409
+
+
+def test_release_selection_applies_technical_hard_filters(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [
+            {
+                "title": "Matrix.1999.1080p.WEB-DL.x264.AAC.SDR",
+                "indexer": "test",
+                "indexerId": 1,
+                "protocol": "torrent",
+                "size": 8_000_000_000,
+                "seeders": 30,
+                "guid": "https://example.test/h264",
+            },
+            {
+                "title": "Matrix.1999.2160p.WEB-DL.x265.HEVC.DTS-HD.HDR10",
+                "indexer": "test",
+                "indexerId": 1,
+                "protocol": "torrent",
+                "size": 20_000_000_000,
+                "seeders": 20,
+                "guid": "https://example.test/hevc",
+            },
+            {
+                "title": "Matrix.1999.2160p.WEB-DL.AV1.DTS.HDR10",
+                "indexer": "test",
+                "indexerId": 1,
+                "protocol": "torrent",
+                "size": 12_000_000_000,
+                "seeders": 100,
+                "guid": "https://example.test/av1",
+            },
+        ],
+    )
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    ).json()
+
+    selected = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "local-test-key"},
+        json={
+            "minSize": 10_000_000_000,
+            "maxSize": 25_000_000_000,
+            "allowedResolutions": ["2160p"],
+            "allowedVideoCodecs": ["hevc"],
+            "allowedSources": ["web-dl"],
+            "allowedHdr": ["hdr10"],
+            "allowedAudioCodecs": ["dts-hd"],
+        },
+    )
+
+    assert selected.status_code == 200
+    data = selected.json()
+    assert data["selectedResult"]["guid"] == "https://example.test/hevc"
+    assert data["selectedResult"]["mediaInfo"] == {
+        "resolution": "2160p",
+        "videoCodecs": ["hevc"],
+        "sources": ["web-dl"],
+        "hdr": ["hdr10"],
+        "audioCodecs": ["dts-hd"],
+    }
+    assert data["selectionCriteria"]["allowedVideoCodecs"] == ["hevc"]
+
+
+def test_release_selection_rejects_unknown_technical_metadata(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix.1080p.WEB-DL",
+            "protocol": "torrent",
+            "size": 8_000_000_000,
+            "seeders": 20,
+            "guid": "https://example.test/unknown-codec",
+        }],
+    )
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    ).json()
+
+    response = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"allowedVideoCodecs": ["hevc"]},
+    )
+
+    assert response.status_code == 409
+
+
+def test_quality_profile_supplies_selection_criteria(monkeypatch) -> None:
+    client = make_search_client(monkeypatch, [{
+        "title": "Matrix.1999.1080p.WEB-DL.x265.HEVC.DTS-HD.HDR10",
+        "protocol": "torrent",
+        "size": 12_000_000_000,
+        "seeders": 20,
+        "guid": "https://example.test/profile",
+    }])
+    client.app.state.settings.selection_profiles = {
+        "2": {
+            "name": "1080p HEVC",
+            "criteria": {
+                "allowedResolutions": ["1080p"],
+                "allowedVideoCodecs": ["hevc"],
+                "maxSize": 15_000_000_000,
+            },
+        }
+    }
+    assert client.get("/api/v3/qualityProfile").json()[0]["name"] == "1080p HEVC"
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"query": "Матрица"},
+    ).json()
+
+    selected = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "local-test-key"},
+        json={"qualityProfileId": 2},
+    )
+
+    assert selected.status_code == 200
+    assert selected.json()["selectionCriteria"]["allowedResolutions"] == ["1080p"]
 
 
 def test_download_plan_is_preview_only(monkeypatch) -> None:

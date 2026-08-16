@@ -64,9 +64,47 @@ POST /api/internal/dry-run/search/{job_id}/select
 ```
 
 The endpoint ranks only the safe metadata already stored in the job and saves
-the selected result with `status: selected`. It supports protocol, minimum
-seeders, maximum size, language, and quality preferences. It has no download
-client integration and cannot start a search by itself.
+the selected result with `status: selected`. It supports hard constraints and
+soft preferences for:
+
+```text
+minSize / maxSize              bytes
+minResolution / maxResolution 480p, 720p, 1080p, 2160p
+allowedResolutions             exact resolution allow-list
+allowedVideoCodecs             h264, hevc, av1, vp9
+allowedSources                 web-dl, webrip, bluray, bdremux, remux
+allowedHdr                     sdr, hdr, hdr10, hdr10+, dv
+allowedAudioCodecs             aac, ac3, eac3, dts, dts-hd, truehd, atmos
+minSeeders / preferredLanguages / preferredQuality
+```
+
+The corresponding `preferred*` fields (`preferredResolutions`,
+`preferredVideoCodecs`, `preferredSources`, `preferredHdr`, and
+`preferredAudioCodecs`) affect ranking but do not reject a release. Technical
+metadata is read from explicit Prowlarr fields when available and otherwise
+parsed from the release title. When a hard technical filter is enabled and a
+release does not expose that attribute, Foxarr rejects it rather than guessing.
+
+Profiles can be supplied through `FOXARR_SELECTION_PROFILES_JSON`. A profile
+can be selected by passing `qualityProfileId` to the internal selection
+endpoint; request criteria override the profile's defaults. Example:
+
+```json
+{
+  "1": {
+    "name": "1080p HEVC",
+    "criteria": {
+      "maxSize": 15000000000,
+      "allowedResolutions": ["1080p"],
+      "allowedVideoCodecs": ["hevc"],
+      "allowedSources": ["web-dl", "bluray"],
+      "allowedAudioCodecs": ["eac3", "dts-hd"]
+    }
+  }
+}
+```
+
+It has no download client integration and cannot start a search by itself.
 
 For the next integration stage, a selected job can produce a side-effect-free
 download plan:

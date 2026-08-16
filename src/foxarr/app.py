@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ class FoxarrSettings:
         download_dir: str | None = None,
         movie_download_dir: str | None = None,
         series_download_dir: str | None = None,
+        selection_profiles: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
         self.api_key = api_key if api_key is not None else os.environ.get("FOXARR_API_KEY", "")
@@ -60,6 +63,29 @@ class FoxarrSettings:
         self.series_download_dir = series_download_dir or os.environ.get(
             "FOXARR_TRANSMISSION_SERIES_DIR", "/home/blackfox/data/serial"
         )
+        if selection_profiles is not None:
+            self.selection_profiles = selection_profiles
+        else:
+            raw_profiles = os.environ.get("FOXARR_SELECTION_PROFILES_JSON", "")
+            if raw_profiles:
+                try:
+                    parsed_profiles = json.loads(raw_profiles)
+                except JSONDecodeError as error:
+                    raise ValueError("FOXARR_SELECTION_PROFILES_JSON must be valid JSON") from error
+                if not isinstance(parsed_profiles, dict):
+                    raise ValueError("FOXARR_SELECTION_PROFILES_JSON must be a JSON object")
+                self.selection_profiles = {
+                    str(profile_id): profile
+                    for profile_id, profile in parsed_profiles.items()
+                    if isinstance(profile, dict)
+                }
+            else:
+                self.selection_profiles = {
+                    str(self.quality_profile_id): {
+                        "name": self.quality_profile_name,
+                        "criteria": {},
+                    }
+                }
 
 
 def create_app(
@@ -101,7 +127,23 @@ def create_app(
 
     @app.get("/api/{ver}/qualityProfile")
     async def quality_profile(ver: str) -> list[dict[str, Any]]:
-        return [
+        profiles = []
+        for profile_id, profile in settings.selection_profiles.items():
+            try:
+                numeric_id = int(profile_id)
+            except ValueError:
+                continue
+            profiles.append(
+                {
+                    "id": numeric_id,
+                    "name": str(profile.get("name", f"Profile {numeric_id}")),
+                    "upgradeAllowed": False,
+                    "cutoff": 0,
+                    "items": [],
+                    "language": {"id": 1, "name": "Any"},
+                }
+            )
+        return profiles or [
             {
                 "id": settings.quality_profile_id,
                 "name": settings.quality_profile_name,
@@ -219,15 +261,42 @@ def create_app(
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
-            criteria = parse_criteria(payload)
+            criteria_payload = dict(payload)
+            profile_id = criteria_payload.pop("qualityProfileId", None)
+            if profile_id is not None:
+                if not isinstance(profile_id, int) or isinstance(profile_id, bool):
+                    raise TypeError("qualityProfileId must be an integer")
+                profile = settings.selection_profiles.get(str(profile_id))
+                if profile is None:
+                    raise ValueError(f"unknown quality profile: {profile_id}")
+                profile_criteria = profile.get("criteria", {})
+                if not isinstance(profile_criteria, dict):
+                    raise TypeError("quality profile criteria must be an object")
+                merged_criteria = dict(profile_criteria)
+                merged_criteria.update(criteria_payload)
+                criteria_payload = merged_criteria
+            criteria = parse_criteria(criteria_payload)
             job = store.get_search_job(job_id)
             selected_index, selected_result = select_release(job["results"], criteria)
             criteria_payload = {
                 "preferredProtocols": list(criteria.preferred_protocols),
                 "minSeeders": criteria.min_seeders,
+                "minSize": criteria.min_size,
                 "maxSize": criteria.max_size,
                 "preferredLanguages": list(criteria.preferred_languages),
                 "preferredQuality": list(criteria.preferred_quality),
+                "allowedResolutions": list(criteria.allowed_resolutions),
+                "preferredResolutions": list(criteria.preferred_resolutions),
+                "minResolution": criteria.min_resolution,
+                "maxResolution": criteria.max_resolution,
+                "allowedVideoCodecs": list(criteria.allowed_video_codecs),
+                "preferredVideoCodecs": list(criteria.preferred_video_codecs),
+                "allowedSources": list(criteria.allowed_sources),
+                "preferredSources": list(criteria.preferred_sources),
+                "allowedHdr": list(criteria.allowed_hdr),
+                "preferredHdr": list(criteria.preferred_hdr),
+                "allowedAudioCodecs": list(criteria.allowed_audio_codecs),
+                "preferredAudioCodecs": list(criteria.preferred_audio_codecs),
             }
             return store.select_search_job(
                 job_id, selected_index, selected_result, criteria_payload
