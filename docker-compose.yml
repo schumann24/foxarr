@@ -14,6 +14,8 @@ services:
       FOXARR_TRANSMISSION_SERIES_DIR: /home/blackfox/data/serial
       # Leave unset until real Transmission control is explicitly approved.
       # FOXARR_TRANSMISSION_RPC_URL: http://transmission:9091/transmission/rpc
+      # FOXARR_TRANSMISSION_RPC_USERNAME: ***
+      # FOXARR_TRANSMISSION_RPC_PASSWORD: ***
       FOXARR_SELECTION_PROFILES_JSON: '{"1":{"name":"Any <= 8 GB, 5+ seeders","criteria":{"maxSize":8000000000,"minSeeders":5}}}'
       # Prowlarr runs on the Docker host in the current lab setup.
       # FOXARR_PROWLARR_URL: http://host.docker.internal:9696

@@ -683,6 +683,20 @@ def test_transmission_rpc_session_handshake_and_paused_add() -> None:
     assert first["arguments"]["labels"] == ["foxarr", "foxarr-job-2"]
 
 
+def test_transmission_rpc_sends_basic_auth() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Basic dXNlcjpwYXNz"
+        return httpx.Response(200, json={"result": "success"})
+
+    client = TransmissionClient(
+        "http://transmission.test/rpc",
+        username="user",
+        password="pass",
+        transport=httpx.MockTransport(handler),
+    )
+    assert client._rpc("torrent-start", {"ids": [1]})["result"] == "success"
+
+
 def test_transmission_rpc_rejects_non_success_result() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"result": "torrent duplicate"})
@@ -790,7 +804,7 @@ def test_transmission_worker_submit_is_paused_and_idempotent() -> None:
             assert payload["arguments"]["labels"] == ["foxarr", "foxarr-job-6"]
             return httpx.Response(
                 200,
-                json={"result": "success", "arguments": {"torrent-added": torrent}},
+                json={"result": "success", "arguments": {"torrent-added": {"id": 77}}},
             )
         raise AssertionError(method)
 
@@ -816,7 +830,12 @@ def test_transmission_worker_submit_is_paused_and_idempotent() -> None:
     assert second["created"] is False
     assert first["torrent"]["torrentId"] == second["torrent"]["torrentId"] == 77
     assert "secret" not in str(first)
-    assert [call["method"] for call in calls] == ["torrent-get", "torrent-add", "torrent-get"]
+    assert [call["method"] for call in calls] == [
+        "torrent-get",
+        "torrent-add",
+        "torrent-get",
+        "torrent-get",
+    ]
 
 
 def test_transmission_submit_requires_confirmation_before_external_calls(monkeypatch) -> None:

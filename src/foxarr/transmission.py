@@ -123,11 +123,18 @@ class TransmissionClient:
         url: str,
         timeout: float = 15.0,
         transport: httpx.BaseTransport | None = None,
+        username: str | None = None,
+        password: str | None = None,
     ):
         self.url = url
         self.timeout = timeout
         self._transport = transport
         self._session_id = ""
+        self._auth = (
+            httpx.BasicAuth(username, password)
+            if username is not None and password is not None
+            else None
+        )
 
     def _rpc(self, method: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         request = {
@@ -136,7 +143,11 @@ class TransmissionClient:
             "tag": "foxarr",
         }
         headers = {"X-Transmission-Session-Id": self._session_id}
-        with httpx.Client(timeout=self.timeout, transport=self._transport) as client:
+        with httpx.Client(
+            timeout=self.timeout,
+            transport=self._transport,
+            auth=self._auth,
+        ) as client:
             response = client.post(self.url, json=request, headers=headers)
             if response.status_code == 409:
                 session_id = response.headers.get("X-Transmission-Session-Id")
@@ -274,6 +285,13 @@ class TransmissionWorker:
             if not existing:
                 raise TransmissionError("Transmission added torrent but returned no torrent id")
             torrent = existing[0]
+        else:
+            # Transmission's torrent-added/torrent-duplicate object is often
+            # only id/name/hashString. Fetch the authoritative safe snapshot
+            # before persisting a lifecycle state.
+            refreshed = self.client.get_torrent(int(torrent["id"]))
+            if refreshed is not None:
+                torrent = refreshed
         return {
             "created": True,
             "mediaType": media_type,

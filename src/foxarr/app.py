@@ -41,6 +41,8 @@ class FoxarrSettings:
         movie_download_dir: str | None = None,
         series_download_dir: str | None = None,
         transmission_url: str | None = None,
+        transmission_username: str | None = None,
+        transmission_password: str | None = None,
         selection_profiles: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
@@ -73,6 +75,16 @@ class FoxarrSettings:
         )
         self.transmission_url = transmission_url or os.environ.get(
             "FOXARR_TRANSMISSION_RPC_URL", ""
+        )
+        self.transmission_username = (
+            transmission_username
+            if transmission_username is not None
+            else os.environ.get("FOXARR_TRANSMISSION_RPC_USERNAME", "")
+        )
+        self.transmission_password = (
+            transmission_password
+            if transmission_password is not None
+            else os.environ.get("FOXARR_TRANSMISSION_RPC_PASSWORD", "")
         )
         if selection_profiles is not None:
             self.selection_profiles = selection_profiles
@@ -439,7 +451,13 @@ def create_app(
     def transmission_worker() -> TransmissionWorker:
         if not settings.transmission_url:
             raise HTTPException(status_code=503, detail="Transmission is not configured")
-        return TransmissionWorker(TransmissionClient(settings.transmission_url))
+        return TransmissionWorker(
+            TransmissionClient(
+                settings.transmission_url,
+                username=settings.transmission_username or None,
+                password=settings.transmission_password or None,
+            )
+        )
 
     def selected_job(job_id: int) -> dict[str, Any]:
         try:
