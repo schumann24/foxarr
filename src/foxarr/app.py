@@ -263,13 +263,15 @@ def create_app(
                 raise TypeError("request body must be a JSON object")
             criteria_payload = dict(payload)
             profile_id = criteria_payload.pop("qualityProfileId", None)
+            if profile_id is None:
+                profile_id = settings.quality_profile_id
             if profile_id is not None:
                 if not isinstance(profile_id, int) or isinstance(profile_id, bool):
                     raise TypeError("qualityProfileId must be an integer")
                 profile = settings.selection_profiles.get(str(profile_id))
-                if profile is None:
+                if profile is None and payload.get("qualityProfileId") is not None:
                     raise ValueError(f"unknown quality profile: {profile_id}")
-                profile_criteria = profile.get("criteria", {})
+                profile_criteria = profile.get("criteria", {}) if profile else {}
                 if not isinstance(profile_criteria, dict):
                     raise TypeError("quality profile criteria must be an object")
                 merged_criteria = dict(profile_criteria)
@@ -279,6 +281,7 @@ def create_app(
             job = store.get_search_job(job_id)
             selected_index, selected_result = select_release(job["results"], criteria)
             criteria_payload = {
+                "qualityProfileId": profile_id,
                 "preferredProtocols": list(criteria.preferred_protocols),
                 "minSeeders": criteria.min_seeders,
                 "minSize": criteria.min_size,

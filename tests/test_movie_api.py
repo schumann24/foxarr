@@ -381,6 +381,38 @@ def test_quality_profile_supplies_selection_criteria(monkeypatch) -> None:
     assert selected.json()["selectionCriteria"]["allowedResolutions"] == ["1080p"]
 
 
+def test_default_quality_profile_supplies_selection_criteria(monkeypatch) -> None:
+    client = make_search_client(monkeypatch, [{
+        "title": "Matrix.1999.1080p.WEB-DL",
+        "protocol": "torrent",
+        "size": 8_000_000_000,
+        "seeders": 20,
+        "guid": "https://example.test/default-profile",
+    }])
+    client.app.state.settings.quality_profile_id = 1
+    client.app.state.settings.selection_profiles = {
+        "1": {
+            "name": "Any <= 8 GB",
+            "criteria": {"maxSize": 8_000_000_000},
+        }
+    }
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "***"},
+        json={"query": "Матрица"},
+    ).json()
+
+    selected = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "***"},
+        json={},
+    )
+
+    assert selected.status_code == 200
+    assert selected.json()["selectionCriteria"]["qualityProfileId"] == 1
+    assert selected.json()["selectionCriteria"]["maxSize"] == 8_000_000_000
+
+
 def test_download_plan_is_preview_only(monkeypatch) -> None:
     client = make_search_client(
         monkeypatch,
