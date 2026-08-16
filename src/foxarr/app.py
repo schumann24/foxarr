@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from .prowlarr import ProwlarrClient, ProwlarrError
 from .selection import ReleaseSelectionError, parse_criteria, select_release
 from .storage import MovieNotFoundError, MovieStore
-from .transmission import build_download_plan
+from .transmission import build_download_plan, build_resolved_submit_preview
 
 
 class FoxarrSettings:
@@ -258,6 +258,45 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Search job not found") from error
         except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/internal/dry-run/search/{job_id}/submit-preview")
+    async def dry_run_submit_preview(job_id: int, request: Request) -> dict[str, Any]:
+        """Resolve a selected release and preview RPC without submitting it."""
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            download_dir = payload.get("downloadDir", settings.download_dir)
+            if not isinstance(download_dir, str):
+                raise TypeError("downloadDir must be a string")
+            job = store.get_search_job(job_id)
+            if job["status"] not in {"selected", "download_planned"}:
+                raise ValueError("only selected search jobs can be resolved")
+            selected = job["selectedResult"]
+            if not isinstance(selected, dict) or not selected.get("guid"):
+                raise ValueError("selected result has no guid")
+            if not settings.prowlarr_url or not settings.prowlarr_api_key:
+                raise ValueError("Prowlarr is not configured")
+            plan = build_download_plan(
+                job_id,
+                job["selectedIndex"],
+                selected,
+                download_dir,
+            )
+            _, download_url = ProwlarrClient(
+                settings.prowlarr_url,
+                settings.prowlarr_api_key,
+            ).resolve_download_url(
+                job["query"],
+                selected["guid"],
+                indexer_ids=job["indexerIds"],
+            )
+            # The URL is intentionally never passed to storage and never returned.
+            return build_resolved_submit_preview(plan, download_url)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+        except (ProwlarrError, TypeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     return app

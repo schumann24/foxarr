@@ -50,6 +50,44 @@ class ProwlarrClient:
         results = [self._safe_release(item) for item in payload if isinstance(item, dict)]
         return results[:limit]
 
+    def resolve_download_url(
+        self,
+        query: str,
+        guid: str,
+        indexer_ids: list[int] | None = None,
+        limit: int = 100,
+    ) -> tuple[dict[str, Any], str]:
+        """Re-search and resolve one guid; the executable URL stays in memory only."""
+        if not guid.strip():
+            raise ValueError("guid must not be empty")
+        params: dict[str, Any] = {"query": query.strip(), "limit": limit}
+        if indexer_ids:
+            params["indexerIds"] = indexer_ids
+        try:
+            response = httpx.get(
+                f"{self.base_url}/api/v1/search",
+                params=params,
+                headers={"X-Api-Key": self.api_key},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise ProwlarrError(f"Prowlarr resolve failed: {error}") from error
+
+        if not isinstance(payload, list):
+            raise ProwlarrError("Prowlarr resolve returned a non-array response")
+        for item in payload:
+            if not isinstance(item, dict) or item.get("guid") != guid:
+                continue
+            download_url = item.get("downloadUrl") or item.get("magnetUrl")
+            if isinstance(download_url, str) and download_url.startswith(
+                ("magnet:", "http://", "https://")
+            ):
+                return self._safe_release(item), download_url
+            raise ProwlarrError("matching release has no supported download URL")
+        raise ProwlarrError("matching release guid was not found")
+
     @staticmethod
     def _safe_release(item: dict[str, Any]) -> dict[str, Any]:
         """Keep descriptive release fields, never persist executable URLs."""

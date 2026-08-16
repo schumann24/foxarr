@@ -21,7 +21,9 @@ def make_client(api_key: str = "") -> TestClient:
     return TestClient(create_app(store=MovieStore(":memory:"), settings=settings))
 
 
-def make_search_client(monkeypatch, response: list[dict]) -> TestClient:
+def make_search_client(
+    monkeypatch, response: list[dict], api_key: str = ""
+) -> TestClient:
     def fake_get(*args, **kwargs):
         class FakeResponse:
             def raise_for_status(self) -> None:
@@ -35,7 +37,7 @@ def make_search_client(monkeypatch, response: list[dict]) -> TestClient:
     monkeypatch.setattr("foxarr.prowlarr.httpx.get", fake_get)
     settings = FoxarrSettings(
         database=":memory:",
-        api_key="local-test-key",
+        api_key=api_key,
         prowlarr_url="http://prowlarr.test",
         prowlarr_api_key="prowlarr-test-key",
         dry_run=True,
@@ -257,6 +259,52 @@ def test_download_plan_is_preview_only(monkeypatch) -> None:
         f"/api/internal/dry-run/search/{job['id']}",
         headers={"X-Api-Key": "local-test-key"},
     ).json()["status"] == "download_planned"
+
+
+def test_submit_preview_resolves_url_ephemerally(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Matrix 1080p",
+            "indexer": "test",
+            "indexerId": 1,
+            "protocol": "torrent",
+            "size": 10,
+            "seeders": 5,
+            "guid": "https://example.test/1",
+            "downloadUrl": "magnet:?xt=urn:btih:ephemeral-secret",
+        }],
+    )
+    job = client.post(
+        "/api/internal/dry-run/search",
+        headers={"X-Api-Key": "***"},
+        json={"query": "Матрица", "indexerIds": [1]},
+    ).json()
+    client.post(
+        f"/api/internal/dry-run/search/{job['id']}/select",
+        headers={"X-Api-Key": "***"},
+        json={},
+    )
+
+    response = client.post(
+        f"/api/internal/dry-run/search/{job['id']}/submit-preview",
+        headers={"X-Api-Key": "***"},
+        json={"downloadDir": "/downloads/test"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["resolved"] is True
+    assert data["urlKind"] == "magnet"
+    assert data["execution"] == "not_submitted"
+    assert data["rpcPreview"]["arguments"]["filename"] == "<resolved-ephemeral-download-url>"
+    serialized = str(data)
+    assert "ephemeral-secret" not in serialized
+    persisted = client.get(
+        f"/api/internal/dry-run/search/{job['id']}",
+        headers={"X-Api-Key": "***"},
+    ).json()
+    assert "ephemeral-secret" not in str(persisted)
 
 
 def test_transmission_rpc_session_handshake_and_paused_add() -> None:

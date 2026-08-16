@@ -108,3 +108,19 @@ def build_download_plan(
         },
         "execution": "not_submitted",
     }
+
+
+def build_resolved_submit_preview(
+    plan: dict[str, Any],
+    download_url: str,
+) -> dict[str, Any]:
+    """Build a submit preview while deliberately redacting the resolved URL."""
+    arguments = dict(plan["rpcPreview"]["arguments"])
+    arguments["filename"] = "<resolved-ephemeral-download-url>"
+    return {
+        **plan,
+        "resolved": True,
+        "urlKind": "magnet" if download_url.startswith("magnet:") else "http",
+        "rpcPreview": {"method": "torrent-add", "arguments": arguments},
+        "execution": "not_submitted",
+    }

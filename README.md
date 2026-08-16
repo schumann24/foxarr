@@ -81,6 +81,18 @@ deliberately not stored or resolved by this endpoint. Transmission RPC
 handshake and error handling are covered by local mock-transport tests, but no
 Transmission service is configured or called by Foxarr yet.
 
+The selected release can also be resolved by its stored Prowlarr `guid` and
+turned into a redacted submit preview:
+
+```text
+POST /api/internal/dry-run/search/{job_id}/submit-preview
+```
+
+Foxarr re-queries Prowlarr, uses the download URL only in process memory, and
+returns only `urlKind` plus a redacted `torrent-add` preview. The URL is not
+returned, logged, or written to SQLite. `execution` remains
+`not_submitted`.
+
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests
