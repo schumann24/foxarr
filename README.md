@@ -57,6 +57,18 @@ The job stores safe release metadata in SQLite. It never calls Transmission
 and does not persist download or magnet URLs. Search is explicit; a normal
 Seerr movie request does not start it automatically.
 
+When `indexerIds` is an empty array, Foxarr reads the enabled indexers from
+Prowlarr and queries them independently in parallel. Results are merged and
+deduplicated by `guid`; a slow or failed indexer is recorded as a partial
+search error and does not discard successful results from other indexers. The
+job fails only when every indexer search fails.
+
+When `indexerIds` is an empty array, Foxarr reads the enabled indexers from
+Prowlarr and queries them independently in parallel. Results are merged and
+deduplicated by `guid`; a slow or failed indexer is recorded as a partial
+search error and does not discard successful results from other indexers. The
+job fails only when every indexer search fails.
+
 After a completed dry-run job, release selection is also explicit and local:
 
 ```text
@@ -103,6 +115,11 @@ endpoint; request criteria override the profile's defaults. Example:
   }
 }
 ```
+
+The deployed default profile is currently `Any <= 8 GB, 5+ seeders`: a
+release must be no larger than 8,000,000,000 bytes and have at least five
+seeders. Quality, codec, HDR, source, and audio restrictions remain available
+for a future stricter profile.
 
 It has no download client integration and cannot start a search by itself.
 

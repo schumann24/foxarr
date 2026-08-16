@@ -6,6 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from foxarr.app import FoxarrSettings, create_app
+from foxarr.prowlarr import ProwlarrClient
 from foxarr.storage import MovieStore
 from foxarr.transmission import TransmissionClient, TransmissionError
 
@@ -186,6 +187,47 @@ def test_dry_run_requires_configured_prowlarr() -> None:
         json={"query": "Матрица"},
     )
     assert response.status_code == 503
+
+
+def test_all_indexer_search_keeps_fast_results_when_one_indexer_times_out(monkeypatch) -> None:
+    calls: list[list[int]] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/api/v1/indexer"):
+            return FakeResponse([{"id": 1, "enable": True}, {"id": 2, "enable": True}])
+        indexer_ids = kwargs["params"].get("indexerIds", [])
+        calls.append(indexer_ids)
+        if indexer_ids == [1]:
+            raise httpx.ReadTimeout("slow indexer")
+        return FakeResponse([{
+            "title": "Matrix.1080p.WEB-DL.HEVC",
+            "indexer": "fast",
+            "indexerId": 2,
+            "protocol": "torrent",
+            "size": 6_780_000_000,
+            "seeders": 97,
+            "guid": "https://example.test/fast",
+        }])
+
+    monkeypatch.setattr("foxarr.prowlarr.httpx.get", fake_get)
+    client = ProwlarrClient("http://prowlarr.test", "key", timeout=0.1)
+
+    results = client.search("Матрица", indexer_ids=[], limit=20)
+
+    assert len(results) == 1
+    assert results[0]["guid"] == "https://example.test/fast"
+    assert calls == [[1], [2]] or calls == [[2], [1]]
+    assert any("indexer 1" in error for error in client.last_search_errors)
 
 
 def test_dry_run_release_selection_is_persisted(monkeypatch) -> None:
