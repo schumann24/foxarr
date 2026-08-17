@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import httpx
 import pytest
@@ -110,6 +111,235 @@ def test_api_key_can_be_supplied_as_query_or_header() -> None:
 def test_missing_movie_returns_404() -> None:
     response = make_client().get("/api/v3/movie/999")
     assert response.status_code == 404
+
+
+def test_explicit_movie_import_updates_seerr_status() -> None:
+    client = make_client()
+    movie = client.post("/api/v3/movie", json=movie_payload()).json()
+    movie_id = movie["id"]
+
+    imported = client.post(
+        f"/api/internal/movie/{movie_id}/import",
+        json={
+            "movieFile": {
+                "path": "/home/blackfox/data/film/Fight Club (1999).mkv",
+                "size": 123456789,
+            }
+        },
+    )
+
+    assert imported.status_code == 200
+    data = imported.json()
+    assert data["hasFile"] is True
+    assert data["statistics"] == {"movieFileCount": 1, "sizeOnDisk": 123456789}
+    assert data["movieFile"]["path"].endswith("Fight Club (1999).mkv")
+    assert client.get(f"/api/v3/movie/{movie_id}").json()["hasFile"] is True
+
+
+def test_movie_search_rejects_unknown_movie_id(monkeypatch) -> None:
+    client = make_search_client(monkeypatch, [])
+
+    response = client.post(
+        "/api/internal/dry-run/search",
+        json={"query": "Unknown", "movieId": 999},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Movie not found"
+
+
+def test_old_sqlite_schema_gets_movie_job_and_file_migrations(tmp_path) -> None:
+    database = tmp_path / "old-foxarr.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tmdb_id INTEGER NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            original_title TEXT NOT NULL,
+            sort_title TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            overview TEXT NOT NULL,
+            status TEXT NOT NULL,
+            monitored INTEGER NOT NULL DEFAULT 1,
+            quality_profile_id INTEGER NOT NULL DEFAULT 1,
+            profile_id INTEGER NOT NULL DEFAULT 1,
+            title_slug TEXT NOT NULL,
+            minimum_availability TEXT NOT NULL DEFAULT 'released',
+            root_folder_path TEXT NOT NULL,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            search_requested INTEGER NOT NULL DEFAULT 0,
+            has_file INTEGER NOT NULL DEFAULT 0,
+            movie_file_count INTEGER NOT NULL DEFAULT 0,
+            size_on_disk INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE search_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query TEXT NOT NULL,
+            indexer_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            results_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT,
+            dry_run INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    MovieStore(database)
+
+    connection = sqlite3.connect(database)
+    movie_columns = {row[1] for row in connection.execute("PRAGMA table_info(movies)")}
+    job_columns = {row[1] for row in connection.execute("PRAGMA table_info(search_jobs)")}
+    connection.close()
+    assert "movie_file_json" in movie_columns
+    assert {"media_type", "movie_id", "series_id", "target_episode_ids_json"} <= job_columns
+
+
+def test_movie_import_completes_only_the_linked_download_job(monkeypatch) -> None:
+    client = make_search_client(
+        monkeypatch,
+        [{
+            "title": "Fight Club 1080p",
+            "protocol": "torrent",
+            "size": 8_000_000_000,
+            "seeders": 10,
+            "guid": "https://example.test/fight-club",
+        }],
+    )
+    movie = client.post("/api/v3/movie", json=movie_payload()).json()
+    movie_id = movie["id"]
+
+    job = client.post(
+        "/api/internal/dry-run/search",
+        json={"query": "Fight Club", "movieId": movie_id},
+    )
+    assert job.status_code == 200
+    assert job.json()["movieId"] == movie_id
+    job_id = job.json()["id"]
+
+    selected = client.post(f"/api/internal/dry-run/search/{job_id}/select", json={})
+    assert selected.status_code == 200
+    paused = client.post(
+        f"/api/internal/dry-run/search/{job_id}/transmission",
+        json={
+            "torrentId": 42,
+            "status": "stopped",
+            "percentDone": 0,
+            "downloadDir": "/home/blackfox/data/film",
+        },
+    )
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+
+    imported = client.post(
+        f"/api/internal/movie/{movie_id}/import",
+        json={
+            "movieFile": {
+                "path": "/home/blackfox/data/film/Fight Club (1999).mkv",
+                "size": 123456789,
+            }
+        },
+    )
+    assert imported.status_code == 200
+    assert client.get(f"/api/internal/dry-run/search/{job_id}").json()["status"] == "imported"
+
+    queue = client.get("/api/v3/queue").json()
+    assert queue["totalRecords"] == 1
+    assert queue["records"][0]["status"] == "completed"
+    assert queue["records"][0]["trackedDownloadState"] == "imported"
+
+
+def series_payload(tvdb_id: int = 121361) -> dict:
+    return {
+        "tvdbId": tvdb_id,
+        "title": "Игра Престолов",
+        "qualityProfileId": 1,
+        "seasons": [
+            {"seasonNumber": 1, "monitored": True},
+            {"seasonNumber": 2, "monitored": False},
+        ],
+        "tags": [],
+        "seasonFolder": True,
+        "monitored": True,
+        "rootFolderPath": "/tv",
+        "seriesType": "standard",
+        "addOptions": {
+            "ignoreEpisodesWithFiles": True,
+            "searchForMissingEpisodes": False,
+        },
+    }
+
+
+def test_sonarr_series_create_is_idempotent_and_preserves_seasons() -> None:
+    client = make_client()
+
+    first = client.post("/api/v3/series", json=series_payload())
+    second = client.post("/api/v3/series", json=series_payload())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["tvdbId"] == 121361
+    assert {s["seasonNumber"] for s in first.json()["seasons"] if s["monitored"]} == {1}
+
+    series_id = first.json()["id"]
+    episodes = client.get(f"/api/v3/episode?seriesId={series_id}")
+    assert episodes.status_code == 200
+    assert len(episodes.json()) == 3
+    assert {episode["seasonNumber"] for episode in episodes.json()} == {1}
+
+    lookup = client.get("/api/v3/series/lookup?term=tvdb:121361")
+    assert lookup.status_code == 200
+    assert lookup.json()[0]["id"] == series_id
+
+
+def test_existing_series_update_changes_monitored_seasons() -> None:
+    client = make_client()
+    created = client.post("/api/v3/series", json=series_payload()).json()
+    updated_payload = series_payload()
+    updated_payload["seasons"] = [
+        {"seasonNumber": 1, "monitored": True},
+        {"seasonNumber": 2, "monitored": True},
+    ]
+
+    updated = client.put("/api/v3/series", json={**updated_payload, "id": created["id"]})
+
+    assert updated.status_code == 200
+    assert {s["seasonNumber"] for s in updated.json()["seasons"] if s["monitored"]} == {1, 2}
+    episodes = client.get(f"/api/v3/episode?seriesId={created['id']}").json()
+    assert len(episodes) == 6
+
+
+def test_episode_monitor_and_missing_episode_command() -> None:
+    client = make_client()
+    series = client.post("/api/v3/series", json=series_payload()).json()
+    episodes = client.get(f"/api/v3/episode?seriesId={series['id']}").json()
+    episode_id = episodes[0]["id"]
+
+    monitored = client.put(
+        "/api/v3/episode/monitor",
+        json={"episodeIds": [episode_id], "monitored": False},
+    )
+    assert monitored.status_code == 200
+    assert client.get(f"/api/v3/episode/{episode_id}").json()["monitored"] is False
+
+    command = client.post(
+        "/api/v3/command",
+        json={"name": "MissingEpisodeSearch", "seriesId": series["id"]},
+    )
+    assert command.status_code == 200
+    assert command.json()["status"] == "completed"
+    assert command.json()["result"] == "successful"
+    command_id = command.json()["id"]
+    assert client.get(f"/api/v3/command/{command_id}").json()["name"] == "MissingEpisodeSearch"
 
 
 def test_dry_run_search_saves_safe_results_and_job(monkeypatch) -> None:

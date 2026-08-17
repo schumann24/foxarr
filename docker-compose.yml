@@ -1,32 +1,51 @@
+x-foxarr-environment: &foxarr-environment
+  FOXARR_ROOT_FOLDER: /movies
+  FOXARR_SERIES_ROOT_FOLDER: /tv
+  FOXARR_QUALITY_PROFILE_ID: "1"
+  FOXARR_QUALITY_PROFILE_NAME: Any <= 8 GB, 5+ seeders
+  FOXARR_DRY_RUN: "true"
+  FOXARR_TRANSMISSION_MOVIE_DIR: /home/blackfox/data/film
+  FOXARR_TRANSMISSION_SERIES_DIR: /home/blackfox/data/serial
+  FOXARR_SELECTION_PROFILES_JSON: ${FOXARR_SELECTION_PROFILES_JSON:-}
+  # Supply these through a deployment .env file or an orchestration secret.
+  FOXARR_PROWLARR_URL: ${FOXARR_PROWLARR_URL:-}
+  FOXARR_PROWLARR_API_KEY: ${FOXARR_PROWLARR_API_KEY:-}
+  FOXARR_API_KEY: ${FOXARR_API_KEY:-}
+  FOXARR_TRANSMISSION_RPC_URL: ${FOXARR_TRANSMISSION_RPC_URL:-}
+  FOXARR_TRANSMISSION_RPC_USERNAME: ${FOXARR_TRANSMISSION_RPC_USERNAME:-}
+  FOXARR_TRANSMISSION_RPC_PASSWORD: ${FOXARR_TRANSMISSION_RPC_PASSWORD:-}
+
+x-foxarr-common: &foxarr-common
+  build: .
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
 services:
-  foxarr:
-    build: .
-    container_name: foxarr
-    restart: unless-stopped
+  foxarr-radarr:
+    <<: *foxarr-common
+    container_name: foxarr-radarr
     environment:
+      <<: *foxarr-environment
       FOXARR_DATABASE: /data/foxarr.db
-      FOXARR_ROOT_FOLDER: /movies
-      FOXARR_QUALITY_PROFILE_ID: "1"
-      FOXARR_QUALITY_PROFILE_NAME: Any <= 8 GB, 5+ seeders
-      FOXARR_DRY_RUN: "true"
-      # These are paths on the Transmission host (trustno1), not in Foxarr.
-      FOXARR_TRANSMISSION_MOVIE_DIR: /home/blackfox/data/film
-      FOXARR_TRANSMISSION_SERIES_DIR: /home/blackfox/data/serial
-      # Leave unset until real Transmission control is explicitly approved.
-      # FOXARR_TRANSMISSION_RPC_URL: http://transmission:9091/transmission/rpc
-      # FOXARR_TRANSMISSION_RPC_USERNAME: ***
-      # FOXARR_TRANSMISSION_RPC_PASSWORD: ***
-      FOXARR_SELECTION_PROFILES_JSON: '{"1":{"name":"Any <= 8 GB, 5+ seeders","criteria":{"maxSize":8000000000,"minSeeders":5}}}'
-      # Prowlarr runs on the Docker host in the current lab setup.
-      # FOXARR_PROWLARR_URL: http://host.docker.internal:9696
-      # FOXARR_PROWLARR_API_KEY: change-me
-      # FOXARR_API_KEY: change-me
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      FOXARR_ROLE: radarr
     ports:
       - "127.0.0.1:7878:7878"
     volumes:
-      - foxarr-data:/data
+      - foxarr-radarr-data:/data
+
+  foxarr-sonarr:
+    <<: *foxarr-common
+    container_name: foxarr-sonarr
+    environment:
+      <<: *foxarr-environment
+      FOXARR_DATABASE: /data/foxarr.db
+      FOXARR_ROLE: sonarr
+    ports:
+      - "127.0.0.1:8989:7878"
+    volumes:
+      - foxarr-sonarr-data:/data
 
 volumes:
-  foxarr-data:
+  foxarr-radarr-data:
+  foxarr-sonarr-data:

@@ -1,4 +1,4 @@
-"""FastAPI application exposing Foxarr's movie-only Radarr surface."""
+"""FastAPI application exposing Foxarr's minimal Radarr/Sonarr surface."""
 
 from __future__ import annotations
 
@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse
 
 from .prowlarr import ProwlarrClient, ProwlarrError
 from .selection import ReleaseSelectionError, parse_criteria, select_release
-from .storage import MovieNotFoundError, MovieStore
+from .storage import (
+    EpisodeNotFoundError,
+    MovieNotFoundError,
+    MovieStore,
+    SeriesNotFoundError,
+)
 from .transmission import (
     TransmissionClient,
     TransmissionConfirmationRequired,
@@ -40,6 +45,8 @@ class FoxarrSettings:
         download_dir: str | None = None,
         movie_download_dir: str | None = None,
         series_download_dir: str | None = None,
+        role: str | None = None,
+        series_root_folder: str | None = None,
         transmission_url: str | None = None,
         transmission_username: str | None = None,
         transmission_password: str | None = None,
@@ -48,6 +55,12 @@ class FoxarrSettings:
         self.database = database or os.environ.get("FOXARR_DATABASE", "/data/foxarr.db")
         self.api_key = api_key if api_key is not None else os.environ.get("FOXARR_API_KEY", "")
         self.root_folder = root_folder or os.environ.get("FOXARR_ROOT_FOLDER", "/movies")
+        self.role = (role or os.environ.get("FOXARR_ROLE", "radarr")).lower()
+        if self.role not in {"radarr", "sonarr"}:
+            raise ValueError("FOXARR_ROLE must be radarr or sonarr")
+        self.series_root_folder = series_root_folder or os.environ.get(
+            "FOXARR_SERIES_ROOT_FOLDER", "/tv"
+        )
         self.quality_profile_id = quality_profile_id or int(
             os.environ.get("FOXARR_QUALITY_PROFILE_ID", "1")
         )
@@ -138,6 +151,12 @@ def create_app(
 
     @app.get("/api/{ver}/system/status")
     async def system_status(ver: str) -> dict[str, Any]:
+        if settings.role == "sonarr":
+            return {
+                "appName": "Sonarr",
+                "version": "4.0.8.0",
+                "instanceName": "foxarr-sonarr",
+            }
         return {
             "appName": "Radarr",
             "version": "5.8.0.0",
@@ -185,10 +204,11 @@ def create_app(
 
     @app.get("/api/{ver}/rootfolder")
     async def root_folder(ver: str) -> list[dict[str, Any]]:
+        path = settings.series_root_folder if settings.role == "sonarr" else settings.root_folder
         return [
             {
                 "id": 1,
-                "path": settings.root_folder,
+                "path": path,
                 "accessible": True,
                 "freeSpace": 100_000_000_000,
                 "totalSpace": 200_000_000_000,
@@ -199,11 +219,61 @@ def create_app(
     async def tags(ver: str) -> list[Any]:
         return []
 
+    @app.get("/api/{ver}/queue")
+    async def download_queue(
+        ver: str,
+        page: int = 1,
+        page_size: int = Query(default=10, alias="pageSize"),
+    ) -> dict[str, Any]:
+        if page < 1 or page_size < 1 or page_size > 1000:
+            raise HTTPException(status_code=400, detail="page and pageSize must be positive")
+        jobs = store.list_download_jobs(settings.role and ("series" if settings.role == "sonarr" else "movie"))
+        start = (page - 1) * page_size
+        records: list[dict[str, Any]] = []
+        for job in jobs[start : start + page_size]:
+            transmission = job["transmission"]
+            status = job["status"]
+            if status in {"transmission_completed", "imported"}:
+                queue_status = "completed"
+            elif status == "error":
+                queue_status = "failed"
+            else:
+                queue_status = transmission["status"] or "queued"
+            record: dict[str, Any] = {
+                "id": job["id"],
+                "status": queue_status,
+                "trackedDownloadStatus": "warning" if status == "error" else "ok",
+                "trackedDownloadState": status,
+                "size": None,
+                "sizeleft": None,
+                "timeleft": "00:00:00",
+                "downloadId": str(transmission["torrentId"]),
+                "protocol": "torrent",
+                "downloadClient": "Transmission",
+                "indexer": None,
+                "outputPath": transmission["downloadDir"],
+                "errorMessage": transmission["error"],
+            }
+            if job["mediaType"] == "series":
+                record["seriesId"] = job["seriesId"]
+                if job["targetEpisodeIds"]:
+                    record["episodeId"] = job["targetEpisodeIds"][0]
+            records.append(record)
+        return {
+            "page": page,
+            "pageSize": page_size,
+            "sortKey": "timeleft",
+            "sortDirection": "ascending",
+            "totalRecords": len(jobs),
+            "records": records,
+        }
+
     @app.get("/api/{ver}/diskspace")
     async def disk_space(ver: str) -> list[dict[str, Any]]:
+        path = settings.series_root_folder if settings.role == "sonarr" else settings.root_folder
         return [
             {
-                "path": settings.root_folder,
+                "path": path,
                 "label": "foxarr",
                 "freeSpace": 100_000_000_000,
                 "totalSpace": 200_000_000_000,
@@ -238,6 +308,156 @@ def create_app(
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    # Sonarr-compatible series surface. Metadata is intentionally deterministic
+    # in this MVP; Seerr supplies the external TVDB id from its own lookup.
+    @app.get("/api/{ver}/languageprofile")
+    async def language_profiles(ver: str) -> list[dict[str, Any]]:
+        return [{
+            "id": 1,
+            "name": "Any",
+            "upgradeAllowed": False,
+            "cutoff": {"id": 1, "name": "Any"},
+            "languages": [{"id": 1, "name": "Any"}],
+        }]
+
+    @app.get("/api/{ver}/series/lookup")
+    async def series_lookup(ver: str, term: str = "") -> list[dict[str, Any]]:
+        return store.lookup_series(term)
+
+    @app.get("/api/{ver}/series")
+    async def series_list(
+        ver: str,
+        tvdb_id: int | None = Query(default=None, alias="tvdbId"),
+    ) -> list[dict[str, Any]]:
+        return store.list_series(tvdb_id)
+
+    @app.get("/api/{ver}/series/{series_id}")
+    async def series_get(ver: str, series_id: int) -> dict[str, Any]:
+        try:
+            return store.get_series(series_id)
+        except SeriesNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Series not found") from error
+
+    @app.post("/api/{ver}/series")
+    async def series_create(ver: str, request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            return store.create_or_update_series(payload)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.put("/api/{ver}/series")
+    async def series_update(ver: str, request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            if "id" in payload:
+                try:
+                    current = store.get_series(int(payload["id"]))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("id must be a positive integer") from error
+                if "tvdbId" in payload and int(payload["tvdbId"]) != current["tvdbId"]:
+                    raise ValueError("series id and tvdbId do not match")
+                payload = {**payload, "tvdbId": current["tvdbId"]}
+            return store.create_or_update_series(payload)
+        except SeriesNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Series not found") from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/api/{ver}/series/{series_id}")
+    async def series_delete(ver: str, series_id: int) -> None:
+        try:
+            store.delete_series(series_id)
+        except SeriesNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Series not found") from error
+
+    @app.get("/api/{ver}/episode")
+    async def episode_list(
+        ver: str,
+        series_id: int | None = Query(default=None, alias="seriesId"),
+    ) -> list[dict[str, Any]]:
+        return store.list_episodes(series_id)
+
+    @app.get("/api/{ver}/episode/{episode_id}")
+    async def episode_get(ver: str, episode_id: int) -> dict[str, Any]:
+        try:
+            return store.get_episode(episode_id)
+        except EpisodeNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Episode not found") from error
+
+    @app.put("/api/{ver}/episode/monitor")
+    async def episode_monitor(ver: str, request: Request) -> None:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            episode_ids = payload.get("episodeIds", [])
+            monitored = payload.get("monitored", True)
+            if not isinstance(monitored, bool):
+                raise TypeError("monitored must be a boolean")
+            store.monitor_episodes(episode_ids, monitored)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/{ver}/command")
+    async def command_create(ver: str, request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            return store.create_command(payload)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/{ver}/command/{command_id}")
+    async def command_get(ver: str, command_id: int) -> dict[str, Any]:
+        try:
+            return store.get_command(command_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Command not found") from error
+
+    @app.post("/api/internal/series/{series_id}/import")
+    async def import_series_files(series_id: int, request: Request) -> dict[str, Any]:
+        """Record files already imported by the external mirror/Jellyfin flow.
+
+        Foxarr deliberately does not inspect or move files here. The caller
+        must provide paths and sizes that were verified after the mirror step.
+        """
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            episode_files = payload.get("episodeFiles")
+            if not isinstance(episode_files, list):
+                raise TypeError("episodeFiles must be an array")
+            return store.import_episode_files(series_id, episode_files)
+        except SeriesNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Series not found") from error
+        except EpisodeNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Episode not found") from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/internal/movie/{movie_id}/import")
+    async def import_movie_file(movie_id: int, request: Request) -> dict[str, Any]:
+        """Record one file verified by the external mirror/import flow."""
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise TypeError("request body must be a JSON object")
+            movie_file = payload.get("movieFile")
+            if not isinstance(movie_file, dict):
+                raise TypeError("movieFile must be an object")
+            return store.import_movie_file(movie_id, movie_file)
+        except MovieNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Movie not found") from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/api/internal/dry-run/search")
     async def dry_run_search(request: Request) -> dict[str, Any]:
         if not settings.dry_run:
@@ -259,7 +479,14 @@ def create_app(
             limit = payload.get("limit", 20)
             if not isinstance(limit, int) or isinstance(limit, bool):
                 raise TypeError("limit must be an integer")
-            job_id = store.create_search_job(query.strip(), indexer_ids, limit)
+            movie_id = payload.get("movieId")
+            if movie_id is not None and (
+                not isinstance(movie_id, int) or isinstance(movie_id, bool) or movie_id < 1
+            ):
+                raise TypeError("movieId must be a positive integer")
+            job_id = store.create_search_job(
+                query.strip(), indexer_ids, limit, movie_id=movie_id
+            )
             try:
                 results = ProwlarrClient(
                     settings.prowlarr_url,
@@ -268,6 +495,8 @@ def create_app(
                 return store.finish_search_job(job_id, results)
             except (ProwlarrError, TypeError, ValueError) as error:
                 return store.finish_search_job(job_id, [], error=str(error))
+        except MovieNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Movie not found") from error
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -277,6 +506,36 @@ def create_app(
             return store.get_search_job(job_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Search job not found") from error
+
+    @app.post("/api/internal/dry-run/search/{job_id}/run")
+    async def dry_run_run_search(job_id: int) -> dict[str, Any]:
+        """Explicitly execute one queued series search through Prowlarr.
+
+        This endpoint is read-only with respect to external services: it only
+        searches Prowlarr and stores sanitized release metadata. Transmission
+        submission remains a separate confirmation-gated operation.
+        """
+        if not settings.dry_run:
+            raise HTTPException(status_code=409, detail="dry-run mode is disabled")
+        if not settings.prowlarr_url or not settings.prowlarr_api_key:
+            raise HTTPException(status_code=503, detail="Prowlarr is not configured")
+        try:
+            job = store.get_search_job(job_id)
+            if job["mediaType"] != "series":
+                raise ValueError("only series search jobs can be run through this endpoint")
+            store.start_search_job(job_id)
+            try:
+                results = ProwlarrClient(
+                    settings.prowlarr_url,
+                    settings.prowlarr_api_key,
+                ).search(job["query"], indexer_ids=job["indexerIds"], limit=20)
+                return store.finish_search_job(job_id, results)
+            except (ProwlarrError, TypeError, ValueError) as error:
+                return store.finish_search_job(job_id, [], error=str(error))
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Search job not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/api/internal/dry-run/search/{job_id}/select")
     async def dry_run_select_release(job_id: int, request: Request) -> dict[str, Any]:
@@ -343,9 +602,10 @@ def create_app(
             download_client = payload.get("downloadClient", "transmission")
             if not isinstance(download_client, str):
                 raise TypeError("downloadClient must be a string")
-            media_type = payload.get("mediaType", "movie")
-            if media_type not in {"movie", "series"}:
-                raise ValueError("mediaType must be movie or series")
+            job = store.get_search_job(job_id)
+            media_type = payload.get("mediaType", job["mediaType"])
+            if media_type != job["mediaType"]:
+                raise ValueError("mediaType does not match the search job")
             default_dir = (
                 settings.movie_download_dir
                 if media_type == "movie"
@@ -354,7 +614,6 @@ def create_app(
             download_dir = payload.get("downloadDir", default_dir)
             if not isinstance(download_dir, str):
                 raise TypeError("downloadDir must be a string")
-            job = store.get_search_job(job_id)
             if job["status"] != "selected" or job["selectedResult"] is None:
                 raise ValueError("only selected search jobs can be planned")
             plan = build_download_plan(
@@ -378,9 +637,10 @@ def create_app(
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
-            media_type = payload.get("mediaType", "movie")
-            if media_type not in {"movie", "series"}:
-                raise ValueError("mediaType must be movie or series")
+            job = store.get_search_job(job_id)
+            media_type = payload.get("mediaType", job["mediaType"])
+            if media_type != job["mediaType"]:
+                raise ValueError("mediaType does not match the search job")
             default_dir = (
                 settings.movie_download_dir
                 if media_type == "movie"
@@ -389,7 +649,6 @@ def create_app(
             download_dir = payload.get("downloadDir", default_dir)
             if not isinstance(download_dir, str):
                 raise TypeError("downloadDir must be a string")
-            job = store.get_search_job(job_id)
             if job["status"] not in {"selected", "download_planned"}:
                 raise ValueError("only selected search jobs can be resolved")
             selected = job["selectedResult"]
@@ -488,10 +747,10 @@ def create_app(
                 raise TransmissionConfirmationRequired(
                     "Transmission submit requires explicit confirmation"
                 )
-            media_type = payload.get("mediaType", "movie")
-            if media_type not in {"movie", "series"}:
-                raise ValueError("mediaType must be movie or series")
             job = selected_job(job_id)
+            media_type = payload.get("mediaType", job["mediaType"])
+            if media_type != job["mediaType"]:
+                raise ValueError("mediaType does not match the search job")
             selected = job["selectedResult"]
             if not selected.get("guid"):
                 raise ValueError("selected result has no guid")

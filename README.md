@@ -5,17 +5,73 @@
 Foxarr is an open-source bridge for self-hosted media servers. It is designed to let [Seerr](https://seerr.dev/) submit movie requests through a small Radarr-compatible API, then search configured indexers through [Prowlarr](https://prowlarr.com/) and send selected torrents to a download client such as [Transmission](https://transmissionbt.com/).
 
 ```text
-Seerr → Foxarr → Prowlarr → download client → media library
+Seerr → Foxarr (Radarr :7878 / Sonarr :8989) → Prowlarr → Transmission → media library
 ```
 
 ## Status
 
 🚧 **Early development.** The repository now contains a movie-only Radarr-compatible
-MVP. It accepts Seerr movie requests and persists them in SQLite. Prowlarr
-search is currently available only as an explicit read-only dry-run operation;
-Foxarr does not download files.
+MVP plus a minimal Sonarr-compatible series surface. It accepts Seerr movie and
+series requests and persists them in SQLite. Prowlarr search is currently
+available only as an explicit read-only dry-run operation; Foxarr does not
+start external searches from a normal Seerr request and does not download files.
 
 Foxarr is **not** a Radarr fork. It will implement only the Radarr API surface required by Seerr and delegate search and download work to configurable providers.
+
+## Current series MVP
+
+The same application can expose the small Sonarr surface required by Seerr.
+The supplied Docker Compose file starts two isolated roles: Radarr on
+`127.0.0.1:7878` and Sonarr on `127.0.0.1:8989`. Both use the same image but
+separate SQLite volumes. For a single-process test, set `FOXARR_ROLE=sonarr`
+to return Sonarr identity and `/tv` as the root folder.
+
+Implemented endpoints:
+
+```text
+GET    /api/v3/system/status
+GET    /api/v3/qualityProfile
+GET    /api/v3/rootfolder
+GET    /api/v3/tag
+GET    /api/v3/languageprofile
+GET    /api/v3/series/lookup
+GET    /api/v3/series
+GET    /api/v3/series/{id}
+POST   /api/v3/series
+PUT    /api/v3/series
+DELETE /api/v3/series/{id}
+GET    /api/v3/episode?seriesId={id}
+GET    /api/v3/episode/{id}
+PUT    /api/v3/episode/monitor
+POST   /api/v3/command
+GET    /api/v3/command/{id}
+GET    /api/v3/queue
+```
+
+Series creation is idempotent by `tvdbId`. The requested `seasons[]` monitoring
+selection is preserved; only monitored seasons materialize episode rows. The
+`MissingEpisodeSearch` command is recorded as completed and sets
+`searchRequested`, then creates a queued internal search job. The job can be
+run explicitly through `POST /api/internal/dry-run/search/{job_id}/run`; this
+only queries Prowlarr and stores sanitized results. It does not submit a
+torrent. Like the movie surface, unimported series and episodes report
+`hasFile: false`.
+
+After a confirmed Transmission submit, `/api/v3/queue` exposes the safe queue
+snapshot. For Sonarr-role instances, series jobs include `seriesId` and the
+first target `episodeId`; executable download URLs are never included.
+
+After the external media-mirror/import step, the caller can explicitly record
+verified files with `POST /api/internal/series/{series_id}/import` and a body
+such as `{"episodeFiles": [{"episodeId": 1, "path": "/tv/Show/S01E01.mkv", "size": 1000}]}`.
+Foxarr then marks the episodes and series as available, updates statistics,
+and marks a fully imported series job as `imported`. It does not inspect or
+move files and does not call Jellyfin.
+
+Movies use the equivalent `POST /api/internal/movie/{movie_id}/import` endpoint
+with `{"movieFile": {"path": "/movies/Film.mkv", "size": 1000}}`. This sets
+the movie's `hasFile`, `movieFileCount`, `sizeOnDisk`, and safe `movieFile`
+metadata without inspecting the path.
 
 ## Current movie MVP
 
@@ -36,12 +92,16 @@ Movie creation is idempotent by `tmdbId`. The MVP always reports
 `hasFile: false`; `addOptions.searchForMovie` is recorded but does not trigger
 external work.
 
-The explicit, read-only Prowlarr dry-run endpoints are:
+The explicit Prowlarr search endpoints are:
 
 ```text
 POST /api/internal/dry-run/search
 GET  /api/internal/dry-run/search/{job_id}
+POST /api/internal/dry-run/search/{job_id}/run
 ```
+
+A movie search can be linked to its requested movie with `movieId`; this is
+used later to reconcile the verified import with the correct queue job.
 
 Example request:
 
@@ -56,12 +116,6 @@ Example request:
 The job stores safe release metadata in SQLite. It never calls Transmission
 and does not persist download or magnet URLs. Search is explicit; a normal
 Seerr movie request does not start it automatically.
-
-When `indexerIds` is an empty array, Foxarr reads the enabled indexers from
-Prowlarr and queries them independently in parallel. Results are merged and
-deduplicated by `guid`; a slow or failed indexer is recorded as a partial
-search error and does not discard successful results from other indexers. The
-job fails only when every indexer search fails.
 
 When `indexerIds` is an empty array, Foxarr reads the enabled indexers from
 Prowlarr and queries them independently in parallel. Results are merged and
@@ -121,9 +175,11 @@ release must be no larger than 8,000,000,000 bytes and have at least five
 seeders. Quality, codec, HDR, source, and audio restrictions remain available
 for a future stricter profile.
 
-It has no download client integration and cannot start a search by itself.
+It does not start an external search from a normal Seerr movie request.
+An explicit search result can be selected and passed through the controlled
+Transmission flow below.
 
-For the next integration stage, a selected job can produce a side-effect-free
+A selected job can produce a side-effect-free
 download plan:
 
 ```text
@@ -132,9 +188,7 @@ POST /api/internal/dry-run/search/{job_id}/plan
 
 The plan contains a preview of Transmission's `torrent-add` RPC, target
 directory, labels, and `execution: not_submitted`. The real download URL is
-deliberately not stored or resolved by this endpoint. Transmission RPC
-handshake and error handling are covered by local mock-transport tests, but no
-Transmission service is configured or called by Foxarr yet.
+deliberately not stored or resolved by this endpoint.
 
 The selected release can also be resolved by its stored Prowlarr `guid` and
 turned into a redacted submit preview:
@@ -188,13 +242,15 @@ POST /api/internal/transmission/search/{job_id}/stop
 `submit` always sends `paused: true` and is idempotent by the
 `foxarr-job-{job_id}` label. `submit`, `start`, and `stop` require an explicit
 JSON `{"confirm": true}`. Without confirmation, Foxarr performs no Prowlarr
-resolve and no Transmission RPC call. A Transmission completion remains
-`transmission_completed`/`awaiting_external_import`; it does not set Seerr's
-`hasFile` flag.
+resolve and no Transmission RPC call. After a Transmission completion, the job remains
+`transmission_completed` until the external media-mirror verifies the file.
+The explicit movie/series import endpoint then sets the media `hasFile` state,
+marks the linked job `imported`, and makes the queue record `completed`.
 
 ## Planned integrations
 
 - Radarr-compatible API for Seerr movie requests
+- Minimal Sonarr-compatible API for Seerr series requests
 - SQLite-backed request and job state
 - Prowlarr JSON API integration (read-only dry-run first)
 - Release selection by quality, size, seeders, and language
@@ -229,11 +285,17 @@ Run locally:
 uvicorn foxarr.app:app --reload --port 7878
 ```
 
-Or with Docker:
+Or with Docker Compose (copy `.env.example` to `.env` first and fill the
+Prowlarr/API settings):
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
+
+This starts Radarr-compatible Foxarr at `http://127.0.0.1:7878` and
+Sonarr-compatible Foxarr at `http://127.0.0.1:8989`. The current host has an
+old `docker-compose` v1 binary; use Compose v2 (`docker compose`) for the
+provided file.
 
 The SQLite database is stored in `/data/foxarr.db` in the container. Published
 ports default to loopback only.
