@@ -800,7 +800,15 @@ class MovieStore:
                 if exists is None:
                     raise SeriesNotFoundError(series_id)
             if name == "MissingEpisodeSearch":
-                search_job_id = self.create_series_search_job(series_id)
+                season_number = payload.get("seasonNumber")
+                if season_number is not None:
+                    try:
+                        season_number = int(season_number)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("seasonNumber must be a positive integer") from error
+                    if season_number < 0:
+                        raise ValueError("seasonNumber must not be negative")
+                search_job_id = self.create_series_search_job(series_id, season_number)
                 payload = {**payload, "searchJobId": search_job_id}
         now = self._now()
         with self._connect() as connection:
