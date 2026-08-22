@@ -178,9 +178,33 @@ class ProwlarrClient:
             if isinstance(download_url, str) and download_url.startswith(
                 ("magnet:", "http://", "https://")
             ):
-                return self._safe_release(item), download_url
+                return self._safe_release(item), self._resolve_final_url(download_url)
             raise ProwlarrError("matching release has no supported download URL")
         raise ProwlarrError("matching release guid was not found")
+
+    def _resolve_final_url(self, download_url: str) -> str:
+        """Следует за http-редиректом downloadUrl; если он ведёт на magnet — отдаёт magnet.
+
+        Prowlarr иногда отдаёт downloadUrl, который 301-редиректит на magnet:.
+        Transmission не умеет следовать http→magnet редиректу и падает
+        («Couldn't fetch torrent: Moved Permanently»), поэтому резолвим сами.
+        """
+        if not download_url.startswith(("http://", "https://")):
+            return download_url
+        try:
+            r = httpx.get(
+                download_url,
+                headers={"X-Api-Key": self.api_key},
+                timeout=self.timeout,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            return download_url
+        location = r.headers.get("location", "")
+        if location.startswith("magnet:"):
+            return location
+        # обычный http-редирект Transmission сам обработает — отдаём оригинал
+        return download_url
 
     @staticmethod
     def _safe_release(item: dict[str, Any]) -> dict[str, Any]:
